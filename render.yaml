@@ -1,0 +1,42 @@
+services:
+  - type: web
+    name: nextgen-platform
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: PORT
+        value: 8000
+      - key: DATA_DIR
+        value: /app/data
+      # --- Optional: email (only needed for real sign-in emails) ---
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        sync: false
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: SMTP_FROM
+        sync: false
+      # --- Optional: Hugging Face token (better script generation) ---
+      - key: HF_API_TOKEN
+        sync: false
+      # --- Optional: persistent database (free Postgres via Neon/Supabase) ---
+      # Leave unset for the local SQLite file (ephemeral on the free plan).
+      # Set to a Postgres connection string (see KEYS-GUIDE.md section d) to
+      # keep user accounts + library across restarts and redeploys.
+      - key: DATABASE_URL
+        sync: false
+
+# Database behaviour on the free tier:
+# - DATABASE_URL unset (default): local SQLite in /app/data — ephemeral.
+#   User accounts, jobs and generated files RESET on every redeploy/restart.
+#   Acceptable for demo/testing.
+# - DATABASE_URL set to a free Neon/Supabase Postgres connection string:
+#   accounts + library persist. Audio files still live in /app/data (ephemeral
+#   cache only). See KEYS-GUIDE.md section (d) for the 2-minute setup.

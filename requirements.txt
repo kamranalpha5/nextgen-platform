@@ -1,0 +1,6 @@
+fastapi>=0.115,<0.117
+uvicorn[standard]>=0.30,<0.33
+itsdangerous>=2.2,<2.3
+edge-tts>=6.1,<7.0
+psycopg2-binary>=2.9,<3.0
+yt-dlp>=2024.1.1,<2026.0

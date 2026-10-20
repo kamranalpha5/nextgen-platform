@@ -1,0 +1,6 @@
+venv/
+data/*.db
+data/audio/
+__pycache__/
+.git/
+*.pyc
