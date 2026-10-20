@@ -1077,6 +1077,7 @@ function renderThumbnailStudio(main) {
   // Local editor state (no backend calls in this tool).
   const state = {
     bg: 0,
+    bgImage: null, // AI-generated background (HTMLImageElement) when set
     layers: [
       { text: "YOUR TITLE HERE", size: 120, color: "#ffffff", accent: "#00e5ff", x: 640, y: 300, stroke: true },
     ],
@@ -1087,6 +1088,17 @@ function renderThumbnailStudio(main) {
     <div class="dash-head">
       <h1>🖼️ Thumbnail Studio</h1>
       <p>Design 1280×720 thumbnails in your browser — click the canvas or use sliders to move text.</p>
+    </div>
+    <div class="panel" style="margin-bottom:20px">
+      <h3 style="margin-top:0">🤖 AI thumbnail from your script</h3>
+
+               <p class="small muted">Paste your video script — AI designs a thumbnail concept from the story and renders an HD 16:9 image. Then drop it into the editor below, add the text, and download.</p>
+      <div class="field">
+        <label for="thumb-script">Your video script</label>
+        <textarea class="input" id="thumb-script" rows="5" placeholder="Paste your full video script here…"></textarea>
+      </div>
+      <button class="btn btn-primary" id="thumb-ai-go" type="button">✨ Generate AI thumbnail</button>
+      <div id="thumb-ai-result" style="margin-top:16px"></div>
     </div>
     <div class="thumb-layout">
       <div>
@@ -1119,7 +1131,14 @@ function renderThumbnailStudio(main) {
 
   /** Redraw the full thumbnail from state. */
   function draw() {
-    THUMB_BGS[state.bg].draw(ctx, state.bg);
+    if (state.bgImage) {
+      const img = state.bgImage;
+      const scale = Math.max(THUMB_W / img.width, THUMB_H / img.height);
+      const w = img.width * scale, h = img.height * scale;
+      ctx.drawImage(img, (THUMB_W - w) / 2, (THUMB_H - h) / 2, w, h);
+    } else {
+      THUMB_BGS[state.bg].draw(ctx, state.bg);
+    }
     state.layers.forEach((L) => {
       ctx.save();
       ctx.font = `800 ${L.size}px "Space Grotesk", "Inter", sans-serif`;
@@ -1265,6 +1284,7 @@ function renderThumbnailStudio(main) {
     b.style.backgroundSize = "cover";
     b.addEventListener("click", () => {
       state.bg = i;
+      state.bgImage = null;
       $$(".bg-preset", bgRoot).forEach((el, j) => el.classList.toggle("active", j === i));
       draw();
     });
@@ -1314,6 +1334,7 @@ function renderThumbnailStudio(main) {
   $("#thumb-shuffle", main).addEventListener("click", () => {
     // Randomize background, colors and sizes for a fresh look.
     state.bg = Math.floor(Math.random() * THUMB_BGS.length);
+    state.bgImage = null;
     const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
     state.layers.forEach((L) => {
       L.color = pick(THUMB_COLORS.filter((c) => c !== "#0a0a0a"));
@@ -1331,6 +1352,54 @@ function renderThumbnailStudio(main) {
       downloadBlob(blob, "nextgen-thumbnail-1280x720.png");
       toast("Thumbnail downloaded.", "success");
     }, "image/png");
+  });
+
+  // --- AI thumbnail from script -------------------------------------------
+  $("#thumb-ai-go", main).addEventListener("click", async () => {
+    const script = $("#thumb-script", main).value.trim();
+    if (script.length < 30) { toast("Paste your video script first (at least a short paragraph).", "warning"); return; }
+    const btn = $("#thumb-ai-go", main);
+    const out = $("#thumb-ai-result", main);
+    btn.disabled = true;
+    out.innerHTML = jobLoadingHtml("Generating your thumbnail…", "Reading the script, designing the concept and rendering the HD image — usually under a minute.");
+    try {
+      const { result } = await runJob(
+        "/api/jobs/thumbnail-ai",
+        { script },
+        (job) => {
+          const s = $("[data-job-status]", out);
+          if (s) s.textContent = job.progress || (job.status === "running" ? "Working on it…" : "Queued — starting soon…");
+          const b = $("[data-job-bar]", out);
+          if (b) b.style.width = job.status === "running" ? "60%" : "15%";
+        }
+      );
+      const r = result || {};
+      out.innerHTML = `
+        <img src="${r.image_data_url}" alt="AI thumbnail" style="width:100%;max-width:640px;border-radius:10px;display:block" />
+        ${r.thumbnail_text ? `<p style="margin:10px 0 4px">Suggested on-image text: <strong>${esc(r.thumbnail_text)}</strong></p>` : ""}
+        <div class="output-actions">
+          <button class="btn btn-accent btn-sm" id="thumb-ai-use" type="button">🎨 Use in editor (background + text)</button>
+          <a class="btn btn-ghost btn-sm" href="${r.image_data_url}" download="ai-thumbnail.png">⬇️ Download image</a>
+        </div>`;
+      $("#thumb-ai-use", out).addEventListener("click", () => {
+        const img = new Image();
+        img.onload = () => {
+          state.bgImage = img;
+          if (r.thumbnail_text) {
+            state.layers[0].text = r.thumbnail_text.toUpperCase();
+            state.selected = 0;
+          }
+          $$(".bg-preset", bgRoot).forEach((el) => el.classList.remove("active"));
+          draw(); renderControls();
+          toast("AI thumbnail loaded into the editor.", "success");
+        };
+        img.src = r.image_data_url;
+      });
+    } catch (err) {
+      out.innerHTML = jobErrorHtml(err.message);
+    } finally {
+      btn.disabled = false;
+    }
   });
 
   draw();
@@ -1473,10 +1542,22 @@ function renderChannelAnalyzer(main) {
           </div>
         </div>
         <button class="btn btn-primary" id="analyzer-go" type="submit">Analyze channel</button>
+        <div class="field" style="margin-top:20px;border-top:1px solid var(--border,#2a2a3a);padding-top:16px">
+          <label>🔍 Full analysis — research JSON</label>
+          <div class="hint">Last 50–100 videos with <strong>views + upload dates</strong>, outliers vs the channel median,
+            transcripts of the top 5 and bottom 3 videos, top 30 comments on the best videos and
+            audience requests for a next film — all in one downloadable JSON. Takes a few minutes.</div>
+          <div class="range-row" style="margin-top:8px">
+            <select class="input" id="analyzer-full-count" style="max-width:150px">
+              <option value="50" selected>50 videos</option>
+              <option value="100">100 videos</option>
+            </select>
+            <button class="btn btn-accent" id="analyzer-full-go" type="button">Run full analysis</button>
+          </div>
+        </div>
       </form>
     </div>
     <div id="analyzer-result" style="margin-top:24px"></div>`;
-
   const maxEl = $("#analyzer-max", main);
   maxEl.addEventListener("input", () => {
     $("#analyzer-max-val", main).textContent = maxEl.value;
@@ -1511,6 +1592,139 @@ function renderChannelAnalyzer(main) {
     } finally {
       btn.disabled = false;
     }
+  });
+
+  $("#analyzer-full-go", main).addEventListener("click", async () => {
+    const url = $("#analyzer-url", main).value.trim();
+    if (!url) { toast("Paste a YouTube channel URL first.", "warning"); return; }
+    if (!/^(https?:\/\/)?(www\.|m\.)?(youtube\.com|youtu\.be)\//i.test(url)) {
+      toast("That doesn't look like a YouTube URL.", "warning");
+      return;
+    }
+    const count = parseInt($("#analyzer-full-count", main).value, 10) || 50;
+    const resultEl = $("#analyzer-result", main);
+    const fbtn = $("#analyzer-full-go", main);
+    fbtn.disabled = true;
+    resultEl.innerHTML = jobLoadingHtml("Running full analysis…",
+      "Fetching every video's views and dates, then transcripts and comments. This can take several minutes — keep this tab open.");
+    try {
+      const { jobId, result } = await runJob(
+        "/api/jobs/analyze-full",
+        { youtube_url: url, max_videos: count },
+        (job) => {
+          const s = $("[data-job-status]", resultEl);
+          if (s) s.textContent = job.progress || (job.status === "running" ? "Working on it…" : "Queued — starting soon…");
+          const b = $("[data-job-bar]", resultEl);
+          if (b) b.style.width = job.status === "running" ? "60%" : "15%";
+        }
+      );
+      renderFullResult(resultEl, result || {}, jobId);
+    } catch (err) {
+      resultEl.innerHTML = jobErrorHtml(friendlyAnalyzeError(err.message));
+    } finally {
+      fbtn.disabled = false;
+    }
+  });
+}
+
+/** ISO-8601 duration (PT1H2M3S) -> display text (1:02:03). */
+function isoDurText(iso) {
+  if (!iso || typeof iso !== "string") return "—";
+  const m = iso.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+  if (!m) return iso;
+  const h = +(m[1] || 0), mi = +(m[2] || 0), s = +(m[3] || 0);
+  return h ? `${h}:${String(mi).padStart(2, "0")}:${String(s).padStart(2, "0")}`
+           : `${mi}:${String(s).padStart(2, "0")}`;
+}
+
+function renderFullResult(el, result, jobId) {
+  const md = result.metadata || {};
+  const videos = Array.isArray(result.videos) ? result.videos : [];
+  const outliers = Array.isArray(result.outliers) ? result.outliers : [];
+  const transcripts = Array.isArray(result.transcripts) ? result.transcripts : [];
+  const tstat = result.transcript_status || {};
+  const topComments = Array.isArray(result.top_comments) ? result.top_comments : [];
+  const requests = Array.isArray(result.next_film_requests) ? result.next_film_requests : [];
+  const name = md.channel_name || "Channel";
+  const firstLetter = String(name).trim().charAt(0).toUpperCase() || "?";
+
+  el.innerHTML = `
+    <div class="panel">
+      <div class="channel-header">
+        <div class="channel-avatar">${esc(firstLetter)}</div>
+        <div>
+          <h2>${esc(name)}</h2>
+          <p class="handle">${md.channel_id ? esc(md.channel_id) : ""}</p>
+          <p class="handle">${md.subscribers != null ? `<strong style="color:var(--text)">${esc(fmtNum(md.subscribers))}</strong> subscribers` : ""}</p>
+        </div>
+      </div>
+      <div class="stat-row">
+        <div class="card stat"><div class="val">${esc(fmtNum(videos.length))}</div><div class="lbl">Videos fetched</div></div>
+        <div class="card stat"><div class="val">${esc(fmtNum(md.video_count))}</div><div class="lbl">Videos on channel</div></div>
+        <div class="card stat"><div class="val">${esc(fmtNum(md.total_views))}</div><div class="lbl">Total views (fetched)</div></div>
+        <div class="card stat"><div class="val">${esc(fmtNum(result.median_views))}</div><div class="lbl">Median views</div></div>
+      </div>
+
+      <h3>🚀 Outliers — far above the channel median</h3>
+      <div class="table-wrap"><table class="data">
+        <thead><tr><th>Title</th><th>Views</th><th>× median</th><th>Date</th><th></th></tr></thead>
+        <tbody>
+          ${outliers.map((v) => `<tr>
+            <td>${esc(v.title)}</td>
+            <td class="num">${esc(fmtNum(v.views))}</td>
+            <td class="num">${esc(v.multiple_of_median)}×</td>
+            <td class="num">${esc(fmtDate(v.published_at))}</td>
+            <td><a href="https://www.youtube.com/watch?v=${esc(v.video_id)}" target="_blank" rel="noopener">Open ↗</a></td>
+          </tr>`).join("") || `<tr><td colspan="5" class="muted center">No outliers found in this sample.</td></tr>`}
+        </tbody></table></div>
+
+      <h3>🎬 All videos — views & dates</h3>
+      <div class="table-wrap"><table class="data">
+        <thead><tr><th>Title</th><th>Views</th><th>Likes</th><th>Comments</th><th>Duration</th><th>Date</th><th></th></tr></thead>
+        <tbody>
+          ${videos.map((v) => `<tr>
+            <td>${esc(v.title)}</td>
+            <td class="num">${esc(fmtNum(v.views))}</td>
+            <td class="num">${esc(fmtNum(v.likes))}</td>
+            <td class="num">${esc(fmtNum(v.comments))}</td>
+            <td class="num">${esc(isoDurText(v.duration))}</td>
+            <td class="num">${esc(fmtDate(v.published_at))}</td>
+            <td><a href="https://www.youtube.com/watch?v=${esc(v.video_id)}" target="_blank" rel="noopener">Open ↗</a></td>
+          </tr>`).join("") || `<tr><td colspan="7" class="muted center">No videos returned.</td></tr>`}
+        </tbody></table></div>
+
+      <h3>📝 Transcripts — top 5 & bottom 3 videos ${tstat.requested != null ? `<span class="muted">(${esc(tstat.fetched ?? transcripts.length)}/${esc(tstat.requested)} fetched)</span>` : ""}</h3>
+      ${tstat.warning ? `<p class="small muted">${esc(tstat.warning)}</p>` : ""}
+      ${transcripts.map((t) => `
+        <details style="margin:8px 0">
+          <summary style="cursor:pointer">${esc(t.title)}</summary>
+          <div class="small" style="white-space:pre-wrap;max-height:300px;overflow:auto;padding:10px;border:1px solid var(--border,#2a2a3a);border-radius:8px;margin-top:6px">${esc(t.text)}</div>
+        </details>`).join("") || `<p class="muted">No transcripts available.</p>`}
+
+      <h3>🎬 Audience requests — asking for a next film (${requests.length})</h3>
+      ${requests.map((r) => `
+        <div class="res-item"><span>“${esc(r.text)}” <span class="muted">— ${esc(r.author)} on “${esc(r.video_title)}” (♥ ${esc(fmtNum(r.likes))})</span></span></div>
+      `).join("") || `<p class="muted">No next-film requests found in the top comments.</p>`}
+
+      <h3>💬 Top comments on the best videos</h3>
+      ${result.comments_note ? `<p class="small muted">${esc(result.comments_note)}</p>` : ""}
+      ${topComments.map((g) => `
+        <details style="margin:8px 0">
+          <summary style="cursor:pointer">${esc(g.title)} <span class="muted">(${g.comments.length} comments)</span></summary>
+          ${g.comments.map((c) => `
+            <div class="res-item" style="margin-top:6px"><span>${c.is_next_film_request ? "🎬 " : ""}“${esc(c.text)}” <span class="muted">— ${esc(c.author)} (♥ ${esc(fmtNum(c.likes))})</span></span></div>
+          `).join("")}
+        </details>`).join("") || `<p class="muted">No comments fetched.</p>`}
+
+      <div class="output-actions">
+        <a class="btn btn-ghost btn-sm" href="/api/jobs/${encodeURIComponent(jobId)}/download" download>⬇️ Download JSON</a>
+        <button class="btn btn-ghost btn-sm" id="full-copy">📋 Copy JSON</button>
+      </div>
+    </div>`;
+
+  $("#full-copy", el).addEventListener("click", async () => {
+    const ok = await copyText(JSON.stringify(result, null, 2));
+    toast(ok ? "Full analysis JSON copied." : "Copy failed.", ok ? "success" : "error");
   });
 }
 
@@ -1626,12 +1840,14 @@ function renderResources(main) {
 
   const body = $("#res-body", main);
 
-  /** Extract display text from an item (string or {title,text,...} object). */
+  /** Extract display text from an item (string or {formula/title, example/text} object). */
   const itemText = (item) => {
     if (typeof item === "string") return item;
     if (item && typeof item === "object") {
-      const t = item.text || item.formula || item.prompt || item.item || "";
-      return (item.title ? item.title + " — " : "") + t;
+      const head = item.formula || item.title || item.name || "";
+      const body = item.example || item.text || item.prompt || item.item || "";
+      if (head && body) return head + " — " + body;
+      return head || body;
     }
     return String(item ?? "");
   };
@@ -1656,10 +1872,14 @@ function renderResources(main) {
   api("/api/resources")
     .then((data) => {
       const d = data || {};
+      const ck = d.checklists || {};
       body.innerHTML =
         section("Hook formulas", "🪝", d.hooks) +
         section("Title formulas", "✍️", d.titles) +
-        section("Checklists", "✅", d.checklists) +
+        (Array.isArray(ck)
+          ? section("Checklists", "✅", ck)
+          : section("Pre-upload checklist", "✅", ck.pre_upload || []) +
+            section("Production checklist", "🎬", ck.production || [])) +
         section("Starter prompts", "💡", d.prompts);
       if (!body.innerHTML.trim()) {
         body.innerHTML = `<div class="panel center muted">No resources available yet.</div>`;
