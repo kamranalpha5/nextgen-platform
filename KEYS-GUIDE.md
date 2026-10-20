@@ -58,6 +58,24 @@ functional, just less varied than LLM output.
 
 ---
 
+## (c) Gemini API key — AI thumbnails from a script
+
+Free from Google AI Studio: open https://aistudio.google.com/apikey, sign in
+with any Google account, click "Create API key" (no card needed).
+
+Set:
+
+| Env var | Value |
+|---------|-------|
+| `GEMINI_API_KEY` | the `AIza...` key |
+
+With it: Thumbnail Studio's "AI thumbnail from your script" panel designs a
+thumbnail concept from the pasted script and renders an HD 16:9 image.
+Without it: that panel shows a "not configured" note and the manual
+editor keeps working as before.
+
+---
+
 ## (c) YouTube Data API key — optional reliability upgrade (RESERVED)
 
 The current version fetches channel data with **yt-dlp**, which needs **zero
