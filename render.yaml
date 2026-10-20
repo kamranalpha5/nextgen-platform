@@ -26,6 +26,9 @@ services:
       # --- Optional: Hugging Face token (better script generation) ---
       - key: HF_API_TOKEN
         sync: false
+      # --- Optional: Gemini API key (AI thumbnails from script) ---
+      - key: GEMINI_API_KEY
+        sync: false
       # --- Optional: persistent database (free Postgres via Neon/Supabase) ---
       # Leave unset for the local SQLite file (ephemeral on the free plan).
       # Set to a Postgres connection string (see KEYS-GUIDE.md section d) to
