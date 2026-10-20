@@ -561,17 +561,22 @@ def _enrich_views(videos: list, timeout_per: int = 30, workers: int = 5) -> None
                 [sys.executable, "-m", "yt_dlp",
                  "--no-playlist", "--no-warnings",
                  "--print", "%(view_count)s",
+                 "--print", "%(upload_date)s",
                  "--extractor-args", "youtube:player_client=android",
                  video["url"]],
                 capture_output=True, text=True, timeout=timeout_per,
             )
-            out = (proc.stdout or "").strip().splitlines()
-            if out and out[0].strip().isdigit():
-                video["views"] = int(out[0].strip())
+            out = [ln.strip() for ln in (proc.stdout or "").strip().splitlines()]
+            if out and out[0].isdigit():
+                video["views"] = int(out[0])
+            if len(out) > 1 and len(out[1]) == 8 and out[1].isdigit() \
+                    and not video.get("upload_date"):
+                video["upload_date"] = out[1]
+                video["date"] = f"{out[1][:4]}-{out[1][4:6]}-{out[1][6:8]}"
         except Exception:
             pass
 
-    pending = [v for v in videos if v.get("views") is None]
+    pending = [v for v in videos if v.get("views") is None or not v.get("upload_date")]
     if not pending:
         return
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
@@ -755,7 +760,8 @@ async def job_status(job_id: str):
     job = _get_job(job_id)
     if job is None:
         return JSONResponse(status_code=404, content={"error": "Job not found."})
-    return {"status": job["status"], "result": job["result"], "error": job["error"]}
+    return {"status": job["status"], "result": job["result"], "error": job["error"],
+            "progress": job.get("progress")}
 
 
 @app.get("/api/jobs/{job_id}/download")
@@ -763,17 +769,18 @@ async def job_download(job_id: str):
     job = _get_job(job_id)
     if job is None:
         return JSONResponse(status_code=404, content={"error": "Job not found."})
-    if job["kind"] != "analyze" or job["status"] != "done":
+    if job["kind"] not in ("analyze", "full") or job["status"] != "done":
         return JSONResponse(
             status_code=400,
             content={"ok": False, "error": "Download is only available for completed analysis jobs."},
         )
     payload = json.dumps(job["result"], indent=2, ensure_ascii=False).encode("utf-8")
+    fname = "channel_channel_data.json" if job["kind"] == "full" else "channel-analysis.json"
     return FileResponse(
         path=_write_temp_download(job_id, payload),
         media_type="application/json",
-        filename="channel-analysis.json",
-        headers={"Content-Disposition": 'attachment; filename="channel-analysis.json"'},
+        filename=fname,
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
     )
 
 
@@ -781,6 +788,343 @@ def _write_temp_download(job_id: str, payload: bytes) -> str:
     tmp = DATA_DIR / f"download-{job_id}.json"
     tmp.write_bytes(payload)
     return str(tmp)
+
+
+
+# ----------------------------------------------------------------------------
+# POST /api/jobs/analyze-full — deep channel export
+# ----------------------------------------------------------------------------
+# Produces the full research package for a channel:
+#   metadata    {channel_name, channel_id, subscribers, total_views, video_count}
+#   videos[]    {video_id, title, published_at, views, likes, comments, duration}
+#               for the last N (50–100) videos — views + dates included
+#   outliers[]  videos performing far above the channel median
+#   transcripts[]  full caption text for the top-5 and bottom-3 videos by views
+#   transcript_status {requested, fetched, warning}
+#   top_comments[]   top comments on the best videos, next-film requests flagged
+#   next_film_requests[]  flattened audience asks for a next film
+# ----------------------------------------------------------------------------
+
+def _iso_duration(seconds) -> str | None:
+    """Seconds -> ISO-8601 duration (PT#H#M#S), YouTube API style."""
+    if not isinstance(seconds, (int, float)) or seconds < 0:
+        return None
+    total = int(round(seconds))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    out = "PT"
+    if h:
+        out += f"{h}H"
+    if m:
+        out += f"{m}M"
+    if s or out == "PT":
+        out += f"{s}S"
+    return out
+
+
+def _iso_published(entry: dict) -> str | None:
+    """yt-dlp entry -> ISO-8601 UTC timestamp (YYYY-MM-DDTHH:MM:SSZ)."""
+    ts = entry.get("timestamp")
+    if isinstance(ts, (int, float)) and ts > 0:
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ud = entry.get("upload_date")
+    if ud and len(str(ud)) == 8 and str(ud).isdigit():
+        return f"{ud[:4]}-{ud[4:6]}-{ud[6:8]}T00:00:00Z"
+    return None
+
+
+def _ytdlp_info(url: str, extra_args: list, timeout: int = 60) -> dict | None:
+    """Run yt-dlp -J for one URL; parsed dict or None on any failure."""
+    cmd = [sys.executable, "-m", "yt_dlp", "--no-playlist", "--no-warnings",
+           "-J"] + extra_args + [url]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if proc.returncode != 0 or not proc.stdout:
+            return None
+        return json.loads(proc.stdout)
+    except Exception:
+        return None
+
+
+def _fetch_video_full(video_id: str) -> dict | None:
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    info = _ytdlp_info(url, ["--extractor-args", "youtube:player_client=android"],
+                       timeout=45)
+    if info is None:  # fall back to the default client once
+        info = _ytdlp_info(url, [], timeout=45)
+    return info
+
+
+_NEXT_FILM_RE = re.compile(
+    r"(next\s+(film|movie|video)|part\s*(2|two|ii)\b|sequel|",
+    r"another\s+(one|film|movie|video)|please\s+make|make\s+(a\s+)?(next|another)|",
+    r"waiting\s+for|continue\s+(the\s+)?(story|film|movie)|more\s+like\s+this|",
+    r"next\s+one|bring\s+.*\s+back)",
+    re.IGNORECASE,
+)
+
+
+def _fetch_top_comments(video_id: str, limit: int = 30) -> list:
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    info = _ytdlp_info(
+        url,
+        ["--extractor-args",
+         f"youtube:comment_sort=top;max_comments={limit * 2}"],
+        timeout=90,
+    )
+    if not info:
+        return []
+    out = []
+    for c in (info.get("comments") or []):
+        text = (c.get("text") or "").strip()
+        if not text:
+            continue
+        out.append({
+            "author": c.get("author") or "",
+            "text": text[:600],
+            "likes": c.get("like_count") or 0,
+            "is_next_film_request": bool(_NEXT_FILM_RE.search(text)),
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _fetch_transcript(video_id: str) -> str | None:
+    """Best-effort caption text (manual or auto subs, English first)."""
+    import html
+    import tempfile
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    with tempfile.TemporaryDirectory() as td:
+        cmd = [sys.executable, "-m", "yt_dlp", "--skip-download", "--no-playlist",
+               "--no-warnings", "--write-auto-subs", "--write-subs",
+               "--sub-langs", "en.*", "--sub-format", "vtt",
+               "--extractor-args", "youtube:player_client=android",
+               "-o", os.path.join(td, "%(id)s.%(ext)s"), url]
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        except Exception:
+            return None
+        vtts = sorted(Path(td).glob("*.vtt"))
+        if not vtts:
+            return None
+        raw = vtts[0].read_text(encoding="utf-8", errors="ignore")
+    lines, seen_last = [], None
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith(("WEBVTT", "Kind:", "Language:", "NOTE")):
+            continue
+        if "-->" in line or re.fullmatch(r"\d+", line):
+            continue
+        line = html.unescape(re.sub(r"<[^>]+>", "", line)).strip()
+        if line and line != seen_last:
+            lines.append(line)
+            seen_last = line
+    text = "\n".join(lines).strip()
+    return text or None
+
+
+def _run_full_job(job_id: str, url: str, max_videos: int, cache_key: str) -> None:
+    _set_job(job_id, status="running")
+    try:
+        # 1) Flat channel fetch — ids + channel-level metadata.
+        videos_url = url.rstrip("/")
+        if not re.search(r"/(videos|streams|shorts)$", videos_url):
+            videos_url += "/videos"
+        cmd = [sys.executable, "-m", "yt_dlp", "--flat-playlist",
+               "--dump-single-json", "--playlist-end", str(max_videos),
+               "--extractor-args", "youtube:player_client=android",
+               "--no-warnings", videos_url]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+        if proc.returncode != 0:
+            tail = (proc.stderr or "").strip().splitlines()
+            hint = tail[-1] if tail else "yt-dlp failed"
+            raise RuntimeError(
+                "Could not read that channel — it may be private, age-restricted, "
+                f"or the URL is wrong. ({hint[:160]})"
+            )
+        data = json.loads(proc.stdout or "{}")
+        entries = _collect_video_entries(data, max_videos)
+        ids, seen = [], set()
+        for e in entries:
+            vid = e.get("id")
+            if vid and vid not in seen and e.get("_type") != "playlist":
+                seen.add(vid)
+                ids.append(vid)
+        if not ids:
+            raise RuntimeError("No public videos found at that URL. Check the link and try again.")
+
+        channel_name = data.get("channel") or data.get("uploader") or ""
+        channel_id = data.get("channel_id") or data.get("id") or ""
+        subscribers = data.get("channel_follower_count")
+        total_on_channel = None
+        for e in (data.get("entries") or []):
+            if isinstance(e, dict) and isinstance(e.get("playlist_count"), int):
+                total_on_channel = e["playlist_count"]
+                break
+
+        # 2) Full per-video extraction in parallel (views, dates, likes...).
+        _set_job(job_id, status="running", progress=f"Fetching details for {len(ids)} videos…")
+        infos: dict = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            for vid, info in zip(ids, pool.map(_fetch_video_full, ids)):
+                if info:
+                    infos[vid] = info
+
+        videos = []
+        for vid in ids:
+            info = infos.get(vid)
+            if not info:
+                continue
+            videos.append({
+                "video_id": vid,
+                "title": info.get("title") or "Untitled",
+                "published_at": _iso_published(info),
+                "views": info.get("view_count"),
+                "likes": info.get("like_count"),
+                "comments": info.get("comment_count"),
+                "duration": _iso_duration(info.get("duration")),
+                "_views_sort": info.get("view_count") or 0,
+            })
+        videos.sort(key=lambda v: v["published_at"] or "", reverse=True)
+        if not videos:
+            raise RuntimeError("Could not fetch video details for that channel. Please try again.")
+
+        total_views = sum(v["views"] for v in videos if isinstance(v.get("views"), int))
+        metadata = {
+            "channel_name": channel_name,
+            "channel_id": channel_id,
+            "subscribers": subscribers,
+            "total_views": total_views,
+            "video_count": total_on_channel if total_on_channel else len(videos),
+        }
+
+        # 3) Outliers vs the channel median.
+        import statistics
+        view_vals = sorted(v["_views_sort"] for v in videos if v["_views_sort"] > 0)
+        median_views = statistics.median(view_vals) if view_vals else 0
+        outliers = []
+        if median_views:
+            for v in sorted(videos, key=lambda x: x["_views_sort"], reverse=True):
+                ratio = v["_views_sort"] / median_views
+                if ratio >= 2 and v["_views_sort"] > 0:
+                    outliers.append({
+                        "video_id": v["video_id"], "title": v["title"],
+                        "views": v["views"], "published_at": v["published_at"],
+                        "multiple_of_median": round(ratio, 1),
+                    })
+
+        # 4) Transcripts — top 5 + bottom 3 by views.
+        by_views = sorted(videos, key=lambda x: x["_views_sort"], reverse=True)
+        picked, picked_ids = [], set()
+        for v in by_views[:5] + by_views[-3:]:
+            if v["video_id"] not in picked_ids:
+                picked_ids.add(v["video_id"])
+                picked.append(v)
+        _set_job(job_id, status="running",
+                 progress=f"Fetching transcripts for {len(picked)} videos…")
+        transcripts = []
+        for v in picked:
+            text = _fetch_transcript(v["video_id"])
+            if text:
+                transcripts.append({
+                    "title": v["title"], "video_id": v["video_id"], "text": text,
+                })
+        transcript_status = {"requested": len(picked), "fetched": len(transcripts)}
+        if len(transcripts) < len(picked):
+            transcript_status["warning"] = (
+                f"Fetched {len(transcripts)}/{len(picked)} transcripts — "
+                "some videos have no public captions."
+            )
+
+        # 5) Top comments on the 3 best videos + next-film requests.
+        _set_job(job_id, status="running", progress="Fetching top comments…")
+        top_comments, next_film_requests = [], []
+        for v in by_views[:3]:
+            comments = _fetch_top_comments(v["video_id"], limit=30)
+            if comments:
+                top_comments.append({
+                    "video_id": v["video_id"], "title": v["title"],
+                    "comments": comments,
+                })
+                for c in comments:
+                    if c["is_next_film_request"]:
+                        next_film_requests.append({
+                            "video_id": v["video_id"], "video_title": v["title"],
+                            "author": c["author"], "text": c["text"],
+                            "likes": c["likes"],
+                        })
+
+        for v in videos:
+            v.pop("_views_sort", None)
+        result = {
+            "metadata": metadata,
+            "videos": videos,
+            "outliers": outliers,
+            "median_views": int(median_views) if median_views else None,
+            "transcripts": transcripts,
+            "transcript_status": transcript_status,
+            "top_comments": top_comments,
+            "next_film_requests": next_film_requests,
+        }
+        if not top_comments:
+            result["comments_note"] = (
+                "YouTube did not return comments for these videos — it blocks "
+                "comment access from server IPs without sign-in. Views, dates, "
+                "outliers and transcripts above are complete."
+            )
+        cache_put("analyze-full", cache_key, result, ttl=3600)
+        _set_job(job_id, status="done", result=result)
+        logger.info("Full job %s done: %d videos, %d transcripts",
+                    job_id, len(videos), len(transcripts))
+    except subprocess.TimeoutExpired:
+        _set_job(job_id, status="error",
+                 error="The channel took too long to read. Try again with fewer videos.")
+    except Exception as exc:
+        logger.error("Full job %s failed: %s", job_id, type(exc).__name__)
+        _set_job(job_id, status="error",
+                 error=str(exc) if isinstance(exc, RuntimeError) else
+                 "Something went wrong during the full analysis. Please try again.")
+
+
+@app.post("/api/jobs/analyze-full")
+async def analyze_full(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Invalid JSON body."})
+    url = str(body.get("youtube_url", "")).strip()
+    max_videos = body.get("max_videos", 50)
+    if not isinstance(max_videos, int) or not (10 <= max_videos <= 100):
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": "max_videos must be an integer between 10 and 100."},
+        )
+    if not url or not YOUTUBE_URL_RE.match(url):
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False,
+                     "error": "That doesn't look like a YouTube channel URL "
+                              "(expected youtube.com/@handle, /channel/ or /c/ link)."},
+        )
+
+    ip = get_client_ip(request)
+    if rate_limited((ip, "jobs/analyze-full"), 3):
+        return _rate_limit_response(3)
+
+    normalized = url.rstrip("/").lower()
+    cache_key = f"{normalized}|{max_videos}"
+    cached = cache_get("analyze-full", cache_key)
+    job_id = _new_job("full")
+    if cached is not None:
+        _set_job(job_id, status="done", result=cached)
+        return JSONResponse(status_code=202, content={"job_id": job_id})
+
+    thread = threading.Thread(
+        target=_run_full_job, args=(job_id, url, max_videos, cache_key), daemon=True
+    )
+    thread.start()
+    return JSONResponse(status_code=202, content={"job_id": job_id})
 
 
 # ----------------------------------------------------------------------------
@@ -1419,6 +1763,134 @@ RESOURCES = {
 @app.get("/api/resources")
 async def resources():
     return RESOURCES
+
+
+# ----------------------------------------------------------------------------
+# POST /api/jobs/thumbnail-ai — script -> HD thumbnail via Gemini (free tier)
+# ----------------------------------------------------------------------------
+# Needs GEMINI_API_KEY (free from Google AI Studio: aistudio.google.com/apikey)
+# in the environment. Two calls with the one key: a text model turns the
+# script into a thumbnail concept + <=3-word on-image text, then an image
+# model renders a 16:9 HD thumbnail. Without the key the job fails with a
+# clear "not configured" message — the manual editor keeps working.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+GEMINI_TEXT_MODEL = "gemini-2.0-flash"
+GEMINI_IMAGE_MODELS = ("gemini-2.5-flash-image", "gemini-2.0-flash-preview-image-generation")
+
+
+def _gemini_generate(model: str, payload: dict, timeout: int = 120) -> dict:
+    req = urllib.request.Request(
+        f"{GEMINI_BASE}/{model}:generateContent?key={GEMINI_API_KEY}",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _gemini_concept(script_text: str) -> dict:
+    """Script -> {image_prompt, thumbnail_text} via the Gemini text model."""
+    instruction = (
+        "You are a YouTube thumbnail designer. Read this video script and return "
+        "ONLY valid JSON (no markdown fences) with two keys:\n"
+        '- "thumbnail_text": the on-image text, MAX 3 words, ALL CAPS, punchy.\n'
+        '- "image_prompt": a detailed image-generation prompt for a viral YouTube '
+        "thumbnail: one dramatic main subject with an exaggerated emotional "
+        "expression or a striking scene from the script, cinematic lighting, "
+        "vivid saturated colors, ultra high contrast, clean composition with the "
+        "subject on one side and copy space on the other, photorealistic, 16:9. "
+        "The image itself must contain NO text, letters or words (text is added "
+        "later by the editor).\n\nSCRIPT:\n"
+    )
+    data = _gemini_generate(GEMINI_TEXT_MODEL, {
+        "contents": [{"parts": [{"text": instruction + script_text[:5000]}]}],
+    })
+    text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text).strip()
+    concept = json.loads(text)
+    if not concept.get("image_prompt"):
+        raise ValueError("Gemini returned no image prompt")
+    concept["thumbnail_text"] = str(concept.get("thumbnail_text", ""))[:40]
+    return concept
+
+
+def _gemini_image(image_prompt: str) -> tuple:
+    """Render the thumbnail image; returns (base64_data, mime_type)."""
+    last_exc = None
+    for model in GEMINI_IMAGE_MODELS:
+        for with_config in (True, False):
+            payload = {"contents": [{"parts": [{"text": image_prompt}]}]}
+            if with_config:
+                payload["generationConfig"] = {
+                    "responseModalities": ["TEXT", "IMAGE"],
+                    "imageConfig": {"aspectRatio": "16:9"},
+                }
+            else:
+                payload["generationConfig"] = {"responseModalities": ["TEXT", "IMAGE"]}
+            try:
+                data = _gemini_generate(model, payload, timeout=180)
+                parts = data["candidates"][0]["content"]["parts"]
+                for part in parts:
+                    inline = part.get("inlineData") or part.get("inline_data")
+                    if inline and inline.get("data"):
+                        return inline["data"], inline.get("mimeType", "image/png")
+                raise ValueError("Gemini returned no image")
+            except Exception as exc:  # try the next model/config combo
+                last_exc = exc
+                continue
+    raise RuntimeError(f"Gemini image generation failed ({type(last_exc).__name__}).")
+
+
+def _run_thumb_job(job_id: str, script_text: str) -> None:
+    _set_job(job_id, status="running")
+    try:
+        if not GEMINI_API_KEY:
+            raise RuntimeError(
+                "AI thumbnails are not configured yet. Add a free Gemini API key "
+                "as GEMINI_API_KEY (Google AI Studio → Get API key; on Render: "
+                "service → Environment) and try again. The manual editor below "
+                "works without it."
+            )
+        _set_job(job_id, status="running", progress="Designing the thumbnail concept…")
+        concept = _gemini_concept(script_text)
+        _set_job(job_id, status="running", progress="Rendering the HD image…")
+        b64, mime = _gemini_image(concept["image_prompt"])
+        _set_job(job_id, status="done", result={
+            "image_data_url": f"data:{mime};base64,{b64}",
+            "thumbnail_text": concept["thumbnail_text"],
+            "image_prompt": concept["image_prompt"],
+            "engine": "gemini",
+        })
+        logger.info("Thumbnail job %s done", job_id)
+    except Exception as exc:
+        logger.error("Thumbnail job %s failed: %s", job_id, type(exc).__name__)
+        _set_job(job_id, status="error",
+                 error=str(exc) if isinstance(exc, RuntimeError) else
+                 "Could not generate the thumbnail. Please try again.")
+
+
+@app.post("/api/jobs/thumbnail-ai")
+async def thumbnail_ai(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Invalid JSON body."})
+    script_text = str(body.get("script", "")).strip()
+    if not (30 <= len(script_text) <= 8000):
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": "script must be 30–8000 characters — paste your video script."},
+        )
+    ip = get_client_ip(request)
+    if rate_limited((ip, "jobs/thumbnail-ai"), 10):
+        return _rate_limit_response(10)
+    job_id = _new_job("thumbnail")
+    thread = threading.Thread(target=_run_thumb_job, args=(job_id, script_text), daemon=True)
+    thread.start()
+    return JSONResponse(status_code=202, content={"job_id": job_id})
 
 
 # ----------------------------------------------------------------------------
