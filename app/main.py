@@ -2811,3 +2811,30 @@ VOICES.extend([
 # `uvicorn app.main:app` (import mode), so this rebind applies there.
 # ----------------------------------------------------------------------------
 GEMINI_TEXT_MODEL = "gemini-2.5-flash"
+
+
+# ----------------------------------------------------------------------------
+# Thumbnail diagnostics: log the real Gemini HTTP status (appended 2026-10-21).
+# _gemini_generate is looked up by name at call time by _gemini_concept and
+# _gemini_image, so rebinding it here wraps every Gemini call. The job handler
+# logs only the exception type, which hides the HTTP status; this wrapper
+# records the status code and the API's error body, then re-raises unchanged.
+# ----------------------------------------------------------------------------
+_orig_gemini_generate = _gemini_generate
+
+def _gemini_generate_logged(model, payload, timeout=120):
+    try:
+        return _orig_gemini_generate(model, payload, timeout=timeout)
+    except Exception as exc:
+        body = None
+        try:
+            body = exc.read().decode("utf-8", "replace")[:500]
+        except Exception:
+            pass
+        logger.error(
+            "Gemini call failed: model=%s http=%s body=%s",
+            model, getattr(exc, "code", None), body,
+        )
+        raise
+
+_gemini_generate = _gemini_generate_logged
