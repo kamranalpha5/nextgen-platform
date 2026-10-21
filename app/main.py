@@ -2838,3 +2838,16 @@ def _gemini_generate_logged(model, payload, timeout=120):
         raise
 
 _gemini_generate = _gemini_generate_logged
+
+
+# ----------------------------------------------------------------------------
+# Thumbnail AI: use models available to new users (appended 2026-10-21).
+# The diagnostic log proved gemini-2.5-flash 404s for this key: "no longer
+# available to new users" (Google recommends gemini-3.8-flash). Listing a
+# model does not mean it is callable. Concept step -> gemini-3.8-flash
+# (confirmed in the key's model list). Image step keeps gemini-2.5-flash-image
+# first and falls back to gemini-3.1-flash-image, dropping the retired
+# 2.0-flash-preview model. Both names are module globals read at call time.
+# ----------------------------------------------------------------------------
+GEMINI_TEXT_MODEL = "gemini-3.8-flash"
+GEMINI_IMAGE_MODELS = ("gemini-2.5-flash-image", "gemini-3.1-flash-image")
