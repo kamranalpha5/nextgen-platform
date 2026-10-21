@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Channel Data — NextGen</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #0b0b16; color: #e8e8f0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 32px 20px 60px; }
+  h1 { font-size: 32px; margin: 0 0 8px; }
+  p.sub { color: #a0a0b8; margin: 0 0 28px; }
+  label { display: block; font-size: 14px; margin: 0 0 8px; color: #c8c8dc; }
+  input[type="text"] { width: 100%; box-sizing: border-box; padding: 13px 14px; border-radius: 10px; border: 1px solid #2c2c44; background: #171728; color: #fff; font-size: 15px; }
+  input[type="text"]:focus { outline: none; border-color: #7c5cf0; }
+  .row { display: flex; align-items: center; gap: 14px; margin: 20px 0; }
+  .row span { color: #a0a0b8; font-size: 14px; }
+  input[type="range"] { flex: 1; accent-color: #7c5cf0; }
+  #count { min-width: 28px; text-align: right; font-variant-numeric: tabular-nums; }
+  button { cursor: pointer; border: 0; border-radius: 10px; padding: 12px 22px; font-size: 15px; font-weight: 600; }
+  button.primary { background: #7c5cf0; color: #fff; }
+  button.primary:disabled { opacity: 0.55; cursor: default; }
+  button.ghost { background: #23233a; color: #e8e8f0; }
+  #status { margin: 18px 0; color: #a0a0b8; min-height: 20px; }
+  #status.error { color: #ff8a8a; }
+  #panel { display: none; margin-top: 8px; border: 1px solid #2c2c44; border-radius: 12px; background: #121222; overflow: hidden; }
+  #panelHead { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; border-bottom: 1px solid #2c2c44; }
+  #panelHead strong { letter-spacing: 0.12em; font-size: 13px; color: #b9aaff; }
+  #panelHead .actions { display: flex; gap: 10px; }
+  #panelHead .actions button { padding: 8px 14px; font-size: 13px; }
+  pre { margin: 0; padding: 16px; overflow: auto; max-height: 70vh; font-size: 13px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
+  #note { margin-top: 14px; color: #e8c87a; font-size: 14px; line-height: 1.5; }
+  a { color: #b9aaff; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Channel Data</h1>
+  <p class="sub">Paste a YouTube channel or video link — get the channel's complete data as JSON, with transcripts.</p>
+
+  <label for="url">YouTube Channel or Video URL</label>
+  <input id="url" type="text" placeholder="https://youtube.com/@channelname" autocomplete="off">
+
+  <div class="row">
+    <span>Videos to fetch</span>
+    <input id="count" type="range" min="1" max="50" value="20">
+    <span id="countVal">20</span>
+  </div>
+
+  <button id="fetchBtn" class="primary">Fetch channel data</button>
+  <div id="status"></div>
+
+  <div id="panel">
+    <div id="panelHead">
+      <strong>CHANNEL DATA</strong>
+      <div class="actions">
+        <button id="dlBtn" class="ghost">Download JSON</button>
+        <button id="copyBtn" class="ghost">Copy</button>
+      </div>
+    </div>
+    <pre id="json"></pre>
+  </div>
+  <div id="note"></div>
+  <p style="margin-top:28px"><a href="/static/">← Back to NextGen</a></p>
+</div>
+<script>
+  const $ = (id) => document.getElementById(id);
+  const slider = $("count"), countVal = $("countVal");
+  slider.addEventListener("input", () => { countVal.textContent = slider.value; });
+  let currentJson = null;
+
+  function setStatus(msg, isError) {
+    const el = $("status");
+    el.textContent = msg || "";
+    el.className = isError ? "error" : "";
+  }
+
+  $("fetchBtn").addEventListener("click", async () => {
+    const url = $("url").value.trim();
+    if (!url) { setStatus("Please paste a YouTube channel or video URL.", true); return; }
+    const btn = $("fetchBtn");
+    btn.disabled = true;
+    $("panel").style.display = "none";
+    $("note").textContent = "";
+    currentJson = null;
+    setStatus("Fetching channel data…");
+    try {
+      const res = await fetch("/api/jobs/channel-data", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ youtube_url: url, max_videos: parseInt(slider.value, 10) }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Request failed.");
+      const jobId = data.job_id;
+      while (true) {
+        await new Promise((r) => setTimeout(r, 3000));
+        const jr = await fetch("/api/jobs/" + jobId);
+        const job = await jr.json();
+        if (job.progress) setStatus(job.progress);
+        if (job.status === "done") {
+          currentJson = job.result;
+          $("json").textContent = JSON.stringify(currentJson, null, 2);
+          $("panel").style.display = "block";
+          if (currentJson.data_note) $("note").textContent = currentJson.data_note;
+          else if (currentJson.transcript_status && currentJson.transcript_status.warning)
+            $("note").textContent = currentJson.transcript_status.warning;
+          setStatus("Done — " + currentJson.videos.length + " videos, "
+            + currentJson.transcript_status.fetched + " transcripts.");
+          break;
+        }
+        if (job.status === "error") throw new Error(job.error || "Fetch failed.");
+      }
+    } catch (e) {
+      setStatus(e.message, true);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  $("dlBtn").addEventListener("click", () => {
+    if (!currentJson) return;
+    const stamp = new Date().toISOString().slice(0, 10);
+    const blob = new Blob([JSON.stringify(currentJson, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "channel_channel_data_" + stamp + ".json";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  });
+
+  $("copyBtn").addEventListener("click", async () => {
+    if (!currentJson) return;
+    const text = JSON.stringify(currentJson, null, 2);
+    try {
+      await navigator.clipboard.writeText(text);
+      $("copyBtn").textContent = "Copied!";
+    } catch (e) {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+      $("copyBtn").textContent = "Copied!";
+    }
+    setTimeout(() => { $("copyBtn").textContent = "Copy"; }, 2000);
+  });
+</script>
+</body>
+</html>

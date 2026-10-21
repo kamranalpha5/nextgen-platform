@@ -1447,6 +1447,7 @@ _CLOSERS = {
     ],
 }
 
+
 _VISUALS = {
     "documentary": [
         "Slow cinematic B-roll related to {t}: shallow depth of field, muted grade, subtle film grain.",
@@ -1492,7 +1493,6 @@ _CTAS = {
     "casual": "If you learned something, hit subscribe — way more rabbit holes where this came from.",
     "mysterious": "Subscribe — some stories are too strange to miss, and this was only the beginning.",
 }
-
 
 def _fill(template: str, topic: str) -> str:
     t = topic.strip()
@@ -1958,8 +1958,7 @@ async def thumbnail_ai(request: Request):
     script_text = str(body.get("script", "")).strip()
     if not (30 <= len(script_text) <= 8000):
         return JSONResponse(
-            status_code=400,
-            content={"ok": False, "error": "script must be 30–8000 characters — paste your video script."},
+            status_code=400, content={"ok": False, "error": "script must be 30–8000 characters — paste your video script."},
         )
     ip = get_client_ip(request)
     if rate_limited((ip, "jobs/thumbnail-ai"), 10):
@@ -2062,11 +2061,295 @@ async def library_delete(item_id: int, request: Request):
         return JSONResponse(status_code=401, content={"error": "unauthorized"})
     with _db_lock, _db() as conn:
         cur = conn.execute(
-            "DELETE FROM library WHERE id = ? AND email = ?", (item_id, email)
+            "DELETE FROM library WHERE id = ? AND email = ?",
+            (email, item_id),
         )
     if cur.rowcount == 0:
         return JSONResponse(status_code=404, content={"error": "Item not found."})
     return {"ok": True}
+
+
+# ----------------------------------------------------------------------------
+# POST /api/jobs/channel-data — ChannelRecipe-style CHANNEL DATA JSON
+# ----------------------------------------------------------------------------
+# Returns exactly the reference shape: metadata{channel_name, channel_id,
+# subscribers, total_views, video_count}, videos[]{video_id, title,
+# published_at, views, likes, comments, duration (ISO 8601)},
+# transcripts[]{title, video_id, text (capped at 5000 chars)},
+# transcript_status{requested, fetched, warning}.
+#
+# Data sources, in order:
+#  1) YouTube Data API v3 (YOUTUBE_API_KEY, free) — the reliable route:
+#     channels.list + uploads playlist + videos.list return real subscriber
+#     totals, views, likes, comments and publish dates from any server.
+#  2) yt-dlp tab fetch (no key) — titles + durations only; stats stay null
+#     because watch-page extraction is walled from datacenter IPs, and the
+#     result carries a data_note saying so.
+# Transcripts are always best-effort via yt-dlp captions (same wall applies).
+# The key is read fresh on every call so a key added later (Render env var)
+# takes effect without a code change.
+YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
+TRANSCRIPT_TEXT_LIMIT = 5000
+
+
+def _yt_key() -> str:
+    return os.getenv("YOUTUBE_API_KEY", "").strip()
+
+
+def _yt_api(resource: str, params: dict) -> dict:
+    """One YouTube Data API GET; raises RuntimeError on any failure."""
+    key = _yt_key()
+    if not key:
+        raise RuntimeError("YouTube Data API key is not configured.")
+    query = dict(params)
+    query["key"] = key
+    url = YOUTUBE_API_BASE + "/" + resource + "?" + urllib.parse.urlencode(query)
+    req = urllib.request.Request(url, headers={"User-Agent": "NextGen/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"YouTube API request failed (HTTP {exc.code}).")
+    except Exception as exc:
+        raise RuntimeError(f"YouTube API request failed ({type(exc).__name__}).")
+
+
+def _yt_api_channel_id(channel_url: str) -> str:
+    """Channel URL (@handle or /channel/UC…) -> channel ID via the Data API."""
+    m = re.search(r"/channel/(UC[A-Za-z0-9_-]+)", channel_url or "")
+    if m:
+        return m.group(1)
+    m = re.search(r"/@([\w.\-]+)", channel_url or "")
+    if m:
+        data = _yt_api("channels", {"part": "id", "forHandle": "@" + m.group(1)})
+        items = data.get("items") or []
+        if items and items[0].get("id"):
+            return items[0]["id"]
+    raise RuntimeError(
+        "Could not find that channel. Check the link and try again."
+    )
+
+
+def _yt_api_channel_data(channel_url: str, max_videos: int) -> tuple:
+    """(metadata, videos) via the Data API — real stats, no scraping."""
+    cid = _yt_api_channel_id(channel_url)
+    ch = _yt_api("channels", {
+        "part": "snippet,statistics,contentDetails", "id": cid,
+    })
+    items = ch.get("items") or []
+    if not items:
+        raise RuntimeError("Could not find that channel. Check the link and try again.")
+    info = items[0]
+    stats = info.get("statistics") or {}
+    snippet = info.get("snippet") or {}
+    uploads = ((info.get("contentDetails") or {}).get("relatedPlaylists") or {}).get("uploads") or ""
+    if not uploads:
+        raise RuntimeError("That channel has no public uploads playlist.")
+
+    def _to_int(value) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    metadata = {
+        "channel_name": snippet.get("title") or "",
+        "channel_id": cid,
+        "subscribers": _to_int(stats.get("subscriberCount")),
+        "total_views": _to_int(stats.get("viewCount")),
+        "video_count": _to_int(stats.get("videoCount")),
+    }
+    # Uploads playlist, newest first, paginated (50/page).
+    video_ids = []
+    page_token = ""
+    while len(video_ids) < max_videos:
+        params = {"part": "contentDetails", "playlistId": uploads, "maxResults": 50}
+        if page_token:
+            params["pageToken"] = page_token
+        pl = _yt_api("playlistItems", params)
+        for item in pl.get("items") or []:
+            vid = ((item.get("contentDetails") or {}).get("videoId") or "")
+            if vid:
+                video_ids.append(vid)
+            if len(video_ids) >= max_videos:
+                break
+        page_token = pl.get("nextPageToken") or ""
+        if not page_token:
+            break
+    videos = []
+    for i in range(0, len(video_ids), 50):
+        batch = video_ids[i:i + 50]
+        data = _yt_api("videos", {
+            "part": "snippet,statistics,contentDetails", "id": ",".join(batch),
+        })
+        for item in data.get("items") or []:
+            st = item.get("statistics") or {}
+            sn = item.get("snippet") or {}
+            cd = item.get("contentDetails") or {}
+            videos.append({
+                "video_id": item.get("id") or "",
+                "title": sn.get("title") or "Untitled",
+                "published_at": sn.get("publishedAt"),
+                "views": _to_int(st.get("viewCount")),
+                "likes": _to_int(st.get("likeCount")),
+                "comments": _to_int(st.get("commentCount")),
+                "duration": cd.get("duration"),
+            })
+    videos.sort(key=lambda v: v["published_at"] or "", reverse=True)
+    return metadata, videos
+
+
+def _channel_data_fallback(channel_url: str, max_videos: int) -> tuple:
+    """Tab fetch only: titles + durations; stats stay null (server wall)."""
+    videos_url = channel_url.rstrip("/")
+    if not re.search(r"/(videos|streams|shorts)$", videos_url):
+        videos_url += "/videos"
+    cmd = [sys.executable, "-m", "yt_dlp", "--flat-playlist",
+           "--dump-single-json", "--playlist-end", str(max_videos),
+           "--extractor-args", "youtube:player_client=android",
+           "--no-warnings", videos_url]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+    if proc.returncode != 0:
+        tail = (proc.stderr or "").strip().splitlines()
+        hint = tail[-1] if tail else "yt-dlp failed"
+        raise RuntimeError(
+            "Could not read that channel — it may be private, age-restricted, "
+            f"or the URL is wrong. ({hint[:160]})"
+        )
+    data = json.loads(proc.stdout or "{}")
+    videos = []
+    seen = set()
+    for e in _collect_video_entries(data, max_videos):
+        vid = e.get("id")
+        if not vid or vid in seen or e.get("_type") == "playlist":
+            continue
+        seen.add(vid)
+        videos.append({
+            "video_id": vid,
+            "title": e.get("title") or "Untitled",
+            "published_at": None,
+            "views": None,
+            "likes": None,
+            "comments": None,
+            "duration": _iso_duration(e.get("duration")),
+        })
+    if not videos:
+        raise RuntimeError("No public videos found at that URL. Check the link and try again.")
+    total_on_channel = None
+    for e in (data.get("entries") or []):
+        if isinstance(e, dict) and isinstance(e.get("playlist_count"), int):
+            total_on_channel = e["playlist_count"]
+            break
+    metadata = {
+        "channel_name": data.get("channel") or data.get("uploader") or "",
+        "channel_id": data.get("channel_id") or data.get("id") or "",
+        "subscribers": data.get("channel_follower_count"),
+        "total_views": None,
+        "video_count": total_on_channel,
+    }
+    return metadata, videos
+
+
+def _run_channel_data_job(job_id: str, url: str, max_videos: int) -> None:
+    _set_job(job_id, status="running")
+    try:
+        # A video link resolves to its channel first — any video URL works.
+        url = _resolve_to_channel_url(url)
+        data_note = None
+        if _yt_key():
+            _set_job(job_id, status="running",
+                     progress="Fetching channel data from YouTube…")
+            try:
+                metadata, videos = _yt_api_channel_data(url, max_videos)
+            except RuntimeError as api_exc:
+                # Quota/key failure must not break the feature: fall back to
+                # the tab fetch (titles + durations) and say so in data_note.
+                logger.warning("YouTube API failed (%s); using tab fallback.", api_exc)
+                metadata, videos = _channel_data_fallback(url, max_videos)
+                data_note = (
+                    "Full stats were not available from the YouTube API "
+                    "(quota or key issue) — showing titles and durations. "
+                    "Views, likes, comments and dates will return once the "
+                    "API key/quota is fixed."
+                )
+        else:
+            _set_job(job_id, status="running", progress="Fetching channel videos…")
+            metadata, videos = _channel_data_fallback(url, max_videos)
+            data_note = (
+                "Views, likes, comments and publish dates need a free YouTube "
+                "Data API key (set YOUTUBE_API_KEY) — YouTube blocks those "
+                "fields from server IPs without it. Titles and durations above "
+                "are complete."
+            )
+        # Transcripts, best-effort, in parallel, text capped at 5000 chars.
+        _set_job(job_id, status="running",
+                 progress=f"Fetching transcripts for {len(videos)} videos…")
+        transcripts = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            for v, text in zip(
+                videos,
+                pool.map(_fetch_transcript, [v["video_id"] for v in videos]),
+            ):
+                if text:
+                    transcripts.append({
+                        "title": v["title"], "video_id": v["video_id"],
+                        "text": text[:TRANSCRIPT_TEXT_LIMIT],
+                    })
+        transcript_status = {"requested": len(videos), "fetched": len(transcripts)}
+        if len(transcripts) < len(videos):
+            transcript_status["warning"] = (
+                f"Fetched {len(transcripts)}/{len(videos)} transcripts — "
+                "some videos have no public captions."
+            )
+        result = {
+            "metadata": metadata,
+            "videos": videos,
+            "transcripts": transcripts,
+            "transcript_status": transcript_status,
+        }
+        if data_note:
+            result["data_note"] = data_note
+        _set_job(job_id, status="done", result=result)
+        logger.info("Channel-data job %s done: %d videos, %d transcripts",
+                    job_id, len(videos), len(transcripts))
+    except subprocess.TimeoutExpired:
+        _set_job(job_id, status="error",
+                 error="The channel took too long to read. Try again with fewer videos.")
+    except Exception as exc:
+        logger.error("Channel-data job %s failed: %s", job_id, type(exc).__name__)
+        _set_job(job_id, status="error",
+                 error=str(exc) if isinstance(exc, RuntimeError) else
+                 "Something went wrong while fetching the channel data. Please try again.")
+
+
+@app.post("/api/jobs/channel-data")
+async def channel_data(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Invalid JSON body."})
+    url = str(body.get("youtube_url", "")).strip()
+    max_videos = body.get("max_videos", 20)
+    if not url or not YOUTUBE_URL_RE.match(url):
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": "Provide a valid YouTube channel or video URL."},
+        )
+    if not isinstance(max_videos, int) or not (1 <= max_videos <= 50):
+        return JSONResponse(status_code=400, content={"ok": False, "error": "max_videos must be 1–50."})
+    ip = get_client_ip(request)
+    if rate_limited((ip, "jobs/channel-data"), 10):
+        return _rate_limit_response(10)
+    job_id = _new_job("channel-data")
+    threading.Thread(
+        target=_run_channel_data_job, args=(job_id, url, max_videos), daemon=True
+    ).start()
+    return JSONResponse(status_code=202, content={"job_id": job_id})
+
+
+@app.get("/channel-data", include_in_schema=False)
+async def channel_data_page():
+    return FileResponse(str(STATIC_DIR / "channel-data.html"))
 
 
 # ----------------------------------------------------------------------------

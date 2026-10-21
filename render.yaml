@@ -29,6 +29,11 @@ services:
       # --- Optional: Gemini API key (AI thumbnails from script) ---
       - key: GEMINI_API_KEY
         sync: false
+      # --- Optional: YouTube Data API key (real Channel Data stats) ---
+      # Free from Google Cloud Console (enable YouTube Data API v3).
+      # Without it, Channel Data returns titles/durations only.
+      - key: YOUTUBE_API_KEY
+        sync: false
       # --- Optional: persistent database (free Postgres via Neon/Supabase) ---
       # Leave unset for the local SQLite file (ephemeral on the free plan).
       # Set to a Postgres connection string (see KEYS-GUIDE.md section d) to
