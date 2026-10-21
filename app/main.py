@@ -1043,3 +1043,265 @@ def _run_full_job(job_id: str, url: str, max_videos: int, cache_key: str) -> Non
 
         # 2) Full per-video extraction in parallel (views, dates, likes...).
         _set_job(job_id, status="running", progress=f"Fetching details for {len(ids)} videos…")
+        infos: dict = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            for vid, info in zip(ids, pool.map(_fetch_video_full, ids)):
+                if info:
+                    infos[vid] = info
+
+        videos = []
+        for vid in ids:
+            info = infos.get(vid)
+            if not info:
+                continue
+            videos.append({
+                "video_id": vid,
+                "title": info.get("title") or "Untitled",
+                "published_at": _iso_published(info),
+                "views": info.get("view_count"),
+                "likes": info.get("like_count"),
+                "comments": info.get("comment_count"),
+                "duration": _iso_duration(info.get("duration")),
+                "_views_sort": info.get("view_count") or 0,
+            })
+        videos.sort(key=lambda v: v["published_at"] or "", reverse=True)
+        if not videos:
+            raise RuntimeError("Could not fetch video details for that channel. Please try again.")
+
+        total_views = sum(v["views"] for v in videos if isinstance(v.get("views"), int))
+        metadata = {
+            "channel_name": channel_name,
+            "channel_id": channel_id,
+            "subscribers": subscribers,
+            "total_views": total_views,
+            "video_count": total_on_channel if total_on_channel else len(videos),
+        }
+        
+        # 3) Outliers vs the channel median.
+        import statistics
+        view_vals = sorted(v["_views_sort"] for v in videos if v["_views_sort"] > 0)
+        median_views = statistics.median(view_vals) if view_vals else 0
+        outliers = []
+        if median_views:
+            for v in sorted(videos, key=lambda x: x["_views_sort"], reverse=True):
+                ratio = v["_views_sort"] / median_views
+                if ratio >= 2 and v["_views_sort"] > 0:
+                    outliers.append({
+                        "video_id": v["video_id"], "title": v["title"],
+                        "views": v["views"], "published_at": v["published_at"],
+                        "multiple_of_median": round(ratio, 1),
+                    })
+
+        # 4) Transcripts — top 5 + bottom 3 by views.
+        by_views = sorted(videos, key=lambda x: x["_views_sort"], reverse=True)
+        picked, picked_ids = [], set()
+        for v in by_views[:5] + by_views[-3:]:
+            if v["video_id"] not in picked_ids:
+                picked_ids.add(v["video_id"])
+                picked.append(v)
+        _set_job(job_id, status="running",
+                 progress=f"Fetching transcripts for {len(picked)} videos…")
+        transcripts = []
+        for v in picked:
+            text = _fetch_transcript(v["video_id"])
+            if text:
+                transcripts.append({
+                    "title": v["title"], "video_id": v["video_id"], "text": text,
+                })
+        transcript_status = {"requested": len(picked), "fetched": len(transcripts)}
+        if len(transcripts) < len(picked):
+            transcript_status["warning"] = (
+                f"Fetched {len(transcripts)}/{len(picked)} transcripts — "
+                "some videos have no public captions."
+            )
+
+        # 5) Top comments on the 3 best videos + next-film requests.
+        _set_job(job_id, status="running", progress="Fetching top comments…")
+        top_comments, next_film_requests = [], []
+        for v in by_views[:3]:
+            comments = _fetch_top_comments(v["video_id"], limit=30)
+            if comments:
+                top_comments.append({
+                    "video_id": v["video_id"], "title": v["title"],
+                    "comments": comments,
+                })
+                for c in comments:
+                    if c["is_next_film_request"]:
+                        next_film_requests.append({
+                            "video_id": v["video_id"], "video_title": v["title"],
+                            "author": c["author"], "text": c["text"],
+                            "likes": c["likes"],
+                        })
+
+        for v in videos:
+            v.pop("_views_sort", None)
+        result = {
+            "metadata": metadata,
+            "videos": videos,
+            "outliers": outliers,
+            "median_views": int(median_views) if median_views else None,
+            "transcripts": transcripts,
+            "transcript_status": transcript_status,
+            "top_comments": top_comments,
+            "next_film_requests": next_film_requests,
+        }
+        if not top_comments:
+            result["comments_note"] = (
+                "YouTube did not return comments for these videos — it blocks "
+                "comment access from server IPs without sign-in. Views, dates, "
+                "outliers and transcripts above are complete."
+            )
+        cache_put("analyze-full", cache_key, result, ttl=3600)
+        _set_job(job_id, status="done", result=result)
+        logger.info("Full job %s done: %d videos, %d transcripts",
+                    job_id, len(videos), len(transcripts))
+    except subprocess.TimeoutExpired:
+        _set_job(job_id, status="error",
+                 error="The channel took too long to read. Try again with fewer videos.")
+    except Exception as exc:
+        logger.error("Full job %s failed: %s", job_id, type(exc).__name__)
+        _set_job(job_id, status="error",
+                 error=str(exc) if isinstance(exc, RuntimeError) else
+                 "Something went wrong during the full analysis. Please try again.")
+
+
+@app.post("/api/jobs/analyze-full")
+async def analyze_full(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Invalid JSON body."})
+    url = str(body.get("youtube_url", "")).strip()
+    max_videos = body.get("max_videos", 50)
+    if not isinstance(max_videos, int) or not (10 <= max_videos <= 100):
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": "max_videos must be an integer between 10 and 100."},
+        )
+    if not url or not YOUTUBE_URL_RE.match(url):
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False,
+                     "error": "That doesn't look like a YouTube channel URL "
+                              "(expected youtube.com/@handle, /channel/ or /c/ link)."},
+        )
+
+    ip = get_client_ip(request)
+    if rate_limited((ip, "jobs/analyze-full"), 3):
+        return _rate_limit_response(3)
+
+    normalized = url.rstrip("/").lower()
+    cache_key = f"{normalized}|{max_videos}"
+    cached = cache_get("analyze-full", cache_key)
+    job_id = _new_job("full")
+    if cached is not None:
+        _set_job(job_id, status="done", result=cached)
+        return JSONResponse(status_code=202, content={"job_id": job_id})
+
+    thread = threading.Thread(
+        target=_run_full_job, args=(job_id, url, max_videos, cache_key), daemon=True
+    )
+    thread.start()
+    return JSONResponse(status_code=202, content={"job_id": job_id})
+
+
+# ----------------------------------------------------------------------------
+# POST /api/jobs/script — AI scriptwriter (Hugging Face, template fallback)
+# ----------------------------------------------------------------------------
+SCRIPT_STYLES = ("documentary", "explainer", "history", "true_crime", "sports", "essay")
+SCRIPT_TONES = ("dramatic", "educational", "casual", "mysterious")
+HF_MODEL = "mistralai/Mistral-7B-Instruct-v0.3"
+HF_URL = "https://router.huggingface.co/v1/chat/completions"
+
+
+def _hf_generate_script(topic: str, style: str, tone: str, length_min: int) -> dict:
+    """Try the Hugging Face chat-completions router. Raises on ANY failure."""
+    system = (
+        "You are a professional YouTube scriptwriter for faceless channels. "
+        "Respond with ONLY valid JSON, no markdown fences, no commentary, "
+        "with keys title, hook, beats (list of heading/narration/visual_note), "
+        "and cta. Narration must be full spoken paragraphs."
+    )
+    user = (
+        f"Write a {length_min}-minute {style} video script in a {tone} tone "
+        f"about: {topic}. Include a catchy title, a 1-2 line hook, "
+        f"{'3' if length_min <= 4 else '4' if length_min <= 10 else '5'} beats "
+        "with narration and visual notes, and a closing call to action."
+    )
+    req = urllib.request.Request(
+        HF_URL,
+        data=json.dumps({
+            "model": HF_MODEL,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "max_tokens": 3000,
+            "temperature": 0.8,
+        }).encode(),
+        headers={
+            "Authorization": f"Bearer {HF_API_TOKEN}",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        data = json.loads(resp.read().decode())
+    content = data["choices"][0]["message"]["content"].strip()
+    # Strip accidental code fences, then parse.
+    if content.startswith("```"):
+        content = re.sub(r"^```[a-zA-Z]*\n?", "", content)
+        content = re.sub(r"\n?```$", "", content).strip()
+    script = json.loads(content)
+    if not all(k in script for k in ("title", "hook", "beats", "cta")):
+        raise ValueError("HF response missing required script fields")
+    if not isinstance(script["beats"], list) or not script["beats"]:
+        raise ValueError("HF response has no beats")
+    return script
+
+
+# --- Template engine: deterministic, style/tone-adapted --------------------
+def _pick(options: list, seed: str):
+    h = int(hashlib.md5(seed.encode()).hexdigest(), 16)
+    return options[h % len(options)]
+
+
+_TITLES = {
+    "documentary": ["{T}: The Story Nobody Told You", "Inside {T} — A Cinematic Deep Dive"],
+    "explainer": ["{T} Explained in {M} Minutes", "Everything About {T}, Simply Explained"],
+    "history": ["The Dark History of {T}", "{T}: What History Tried to Forget"],
+    "true_crime": ["The Chilling Case of {T}", "{T}: The Story That Shocked Everyone"],
+    "sports": ["{T}: The Greatest Story in Sports", "How {T} Changed the Game Forever"],
+    "essay": ["{T} Is Deeper Than You Think — A Video Essay", "What {T} Reveals About All of Us"],
+}
+
+_HOOKS = {
+    "dramatic": [
+        "What you're about to hear about {t} will change the way you see it forever.",
+        "Nobody talks about the dark side of {t} — until now.",
+        "{T} looks harmless on the surface. What lies underneath is a very different story.",
+    ],
+    "educational": [
+        "By the end of this video, you'll understand {t} better than ninety-nine percent of people.",
+        "Let's break down {t} — clearly, simply, and without the fluff.",
+        "Everything you thought you knew about {t}? Let's put it to the test.",
+    ],
+    "casual": [
+        "Okay, so {t} is actually way more interesting than you think — here's why.",
+        "I went down the rabbit hole on {t} so you don't have to. Buckle up.",
+        "Real talk: {t} deserves way more attention than it gets, and here's the proof.",
+    ],
+    "mysterious": [
+        "Something about {t} doesn't add up — and the deeper you look, the stranger it gets.",
+        "They don't want you asking questions about {t}. So let's ask them.",
+        "Behind the official story of {t} lies something nobody expected to find.",
+    ],
+}
+
+_BEAT_HEADINGS = {
+    "documentary": ["Setting the Scene", "The Hidden Layers", "The Human Cost", "The Turning Point", "What Remains"],
+    "explainer": ["The Basics", "How It Really Works", "The Part Everyone Misses", "Why It Matters", "The Big Picture"],
+    "history": ["The Beginning", "The Rise", "The Dark Chapter", "The Fall", "The Legacy"],
+    "true_crime": ["The Victim", "The Investigation", "The Breakthrough", "The Trial", "The Aftermath"],
+    "sports": ["The Underdog", "The Climb", "The Defining Moment", "The Price of Glory", "The Legacy"],
+    "essay": ["The Surface", "The Contradiction", "The Deeper Pattern", "The Uncomfortable Truth", "The Reflection"],
+}
