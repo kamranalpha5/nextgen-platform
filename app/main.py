@@ -2851,3 +2851,90 @@ _gemini_generate = _gemini_generate_logged
 # ----------------------------------------------------------------------------
 GEMINI_TEXT_MODEL = "gemini-3.8-flash"
 GEMINI_IMAGE_MODELS = ("gemini-2.5-flash-image", "gemini-3.1-flash-image")
+
+# ----------------------------------------------------------------------------
+# Voiceover Studio — Piper offline synthesis (appended).
+# Edge-tts is rejected from Render's IPs (WSServerHandshakeError), so synthesis
+# runs locally via the piper binary. Route + audio contract unchanged.
+# ----------------------------------------------------------------------------
+import shutil
+import subprocess
+import sys
+import threading
+
+PIPER_DIR = Path("/app/voices")
+PIPER_VOICES = [
+    "ur_PK-aegis_female-medium",
+    "ur_PK-fasih-medium",
+    "hi_IN-priyamvada-medium",
+    "hi_IN-rohan-medium",
+    "en_US-amy-medium",
+    "en_US-ryan-medium",
+    "en_GB-alan-medium",
+    "en_GB-alba-medium",
+]
+_PIPER_LOCK = threading.Lock()
+
+
+def _piper_cmd():
+    exe = shutil.which("piper")
+    return [exe] if exe else [sys.executable, "-m", "piper"]
+
+
+def _length_scale(rate: str) -> float:
+    # Frontend rate slider is -50..+50; direct API allows -100..+100.
+    # length-scale < 1 = faster. Clamp so -100% cannot divide by zero.
+    try:
+        pct = int(rate.replace("+", "").replace("%", ""))
+    except (ValueError, AttributeError):
+        pct = 0
+    pct = max(-50, min(100, pct))
+    return round(100.0 / (100 + pct), 3)
+
+
+def _run_voiceover_job_piper(job_id: str, text: str, voice: str, rate: str, pitch: str) -> None:
+    # NOTE: pitch has no Piper equivalent and is accepted-but-ignored.
+    _set_job(job_id, status="running")
+    wav_path = DB_AUDIO_DIR / f"{job_id}.wav"
+    out_path = DB_AUDIO_DIR / f"{job_id}.mp3"
+    try:
+        model = PIPER_DIR / f"{voice}.onnx"
+        config = PIPER_DIR / f"{voice}.onnx.json"
+        if not model.exists() or not config.exists():
+            raise RuntimeError(f"Piper model not installed: {voice}")
+        with _PIPER_LOCK:
+            subprocess.run(
+                _piper_cmd() + [
+                    "--model", str(model), "--config", str(config),
+                    "--output_file", str(wav_path),
+                    "--length-scale", str(_length_scale(rate)),
+                ],
+                input=text.encode("utf-8"),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=600, check=True,
+            )
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", str(wav_path),
+                 "-codec:a", "libmp3lame", "-q:a", "4", str(out_path)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=300, check=True,
+            )
+        if not out_path.exists() or out_path.stat().st_size == 0:
+            raise RuntimeError("Piper produced no audio.")
+        _set_job(job_id, status="done",
+                 result={"audio_url": f"/api/jobs/{job_id}/audio"})
+        logger.info("Voiceover job %s done via Piper (%d bytes)",
+                    job_id, out_path.stat().st_size)
+    except Exception as exc:
+        logger.error("Voiceover job %s failed: %s", job_id, type(exc).__name__)
+        _set_job(job_id, status="error",
+                 error="Voiceover synthesis failed. Please try again.")
+    finally:
+        try:
+            wav_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+VOICES = list(PIPER_VOICES)
+_run_voiceover_job = _run_voiceover_job_piper
