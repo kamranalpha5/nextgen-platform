@@ -553,28 +553,36 @@ def _enrich_views(videos: list, timeout_per: int = 30, workers: int = 5) -> None
 
     --flat-playlist entries don't carry view counts, so fetch each video's
     view_count with a lightweight per-video yt-dlp call, in parallel.
-    Failures are ignored — views simply stay None.
+    Datacenter IPs are walled for some player clients, so each video is
+    tried on android, then ios, then web; failures are ignored — views
+    simply stay None.
     """
     def fetch(video: dict) -> None:
-        try:
-            proc = subprocess.run(
-                [sys.executable, "-m", "yt_dlp",
-                 "--no-playlist", "--no-warnings",
-                 "--print", "%(view_count)s",
-                 "--print", "%(upload_date)s",
-                 "--extractor-args", "youtube:player_client=android",
-                 video["url"]],
-                capture_output=True, text=True, timeout=timeout_per,
-            )
-            out = [ln.strip() for ln in (proc.stdout or "").strip().splitlines()]
-            if out and out[0].isdigit():
-                video["views"] = int(out[0])
-            if len(out) > 1 and len(out[1]) == 8 and out[1].isdigit() \
-                    and not video.get("upload_date"):
-                video["upload_date"] = out[1]
-                video["date"] = f"{out[1][:4]}-{out[1][4:6]}-{out[1][6:8]}"
-        except Exception:
-            pass
+        for client in ("android", "ios", "web"):
+            try:
+                proc = subprocess.run(
+                    [sys.executable, "-m", "yt_dlp",
+                     "--no-playlist", "--no-warnings",
+                     "--print", "%(view_count)s",
+                     "--print", "%(upload_date)s",
+                     "--extractor-args", f"youtube:player_client={client}",
+                     video["url"]],
+                    capture_output=True, text=True, timeout=timeout_per,
+                )
+                out = [ln.strip() for ln in (proc.stdout or "").strip().splitlines()]
+                got = False
+                if out and out[0].isdigit():
+                    video["views"] = int(out[0])
+                    got = True
+                if len(out) > 1 and len(out[1]) == 8 and out[1].isdigit() \
+                        and not video.get("upload_date"):
+                    video["upload_date"] = out[1]
+                    video["date"] = f"{out[1][:4]}-{out[1][4:6]}-{out[1][6:8]}"
+                    got = True
+                if got:
+                    return
+            except Exception:
+                continue
 
     pending = [v for v in videos if v.get("views") is None or not v.get("upload_date")]
     if not pending:
@@ -936,12 +944,43 @@ def _resolve_to_channel_url(url: str) -> str:
 
     Lets the analyzer accept any video link (watch, Shorts, youtu.be, live,
     embed) and still return the COMPLETE channel JSON, not just that video.
+
+    Resolution order: YouTube's public oEmbed endpoint first (a plain HTTPS
+    GET — it answers from datacenter IPs where watch-page extraction is
+    walled), then yt-dlp watch-page info (android, then default client).
     """
     m = _VIDEO_URL_RE.search(url or "")
     if not m:
         return url
     vid = m.group(1)
     watch = f"https://www.youtube.com/watch?v={vid}"
+    # 1) oEmbed: no API key, no player extraction — just the author URL.
+    author_url = ""
+    try:
+        req = urllib.request.Request(
+            "https://www.youtube.com/oembed?url="
+            + urllib.parse.quote(watch, safe="") + "&format=json",
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            author_url = (json.loads(resp.read().decode("utf-8")) or {}).get("author_url") or ""
+    except Exception:
+        author_url = ""
+    if author_url:
+        cm = re.search(r"/channel/(UC[A-Za-z0-9_-]+)", author_url)
+        if cm:
+            return f"https://www.youtube.com/channel/{cm.group(1)}/videos"
+        # @handle: pin the channel ID when possible (the proven /channel/
+        # path); otherwise hand the handle's Videos tab to the job's tab
+        # fetch, which reads channel pages fine from servers.
+        handle_info = _ytdlp_info(
+            author_url, ["--extractor-args", "youtube:player_client=android"], timeout=45
+        )
+        cid = (handle_info or {}).get("channel_id") or (handle_info or {}).get("id") or ""
+        if isinstance(cid, str) and cid.startswith("UC"):
+            return f"https://www.youtube.com/channel/{cid}/videos"
+        return author_url.rstrip("/") + "/videos"
+    # 2) yt-dlp watch-page info (android, then default client).
     info = _ytdlp_info(watch, ["--extractor-args", "youtube:player_client=android"],
                        timeout=45)
     if not (info or {}).get("channel_id") and not (info or {}).get("channel_url"):
