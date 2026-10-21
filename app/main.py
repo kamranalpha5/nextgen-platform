@@ -1825,3 +1825,265 @@ RESOURCES = {
             "Pattern interrupts (questions, on-screen text) every 60–90 seconds",
             "Payoff delivered before the 80% mark — no saving it for the end",
             "CTA placed after the payoff, never before it",
+        ],
+    },
+    "prompts": [
+        "Write a 60-second hook for a faceless video about {topic} using the curiosity-gap formula.",
+        "Turn this script beat into 3 B-roll search terms I can use on stock footage sites: {beat}",
+        "Rewrite this narration to sound more dramatic without changing the facts: {text}",
+        "Generate 10 title variations for a video about {topic}, each under 60 characters.",
+        "Write a pinned comment that drives replies for a video about {topic}.",
+        "Summarize this long article into a 5-beat video outline about {topic}: {article}",
+    ],
+}
+
+
+@app.get("/api/resources")
+async def resources():
+    return RESOURCES
+
+
+# ----------------------------------------------------------------------------
+# POST /api/jobs/thumbnail-ai — script -> HD thumbnail via Gemini (free tier)
+# ----------------------------------------------------------------------------
+# Needs GEMINI_API_KEY (free from Google AI Studio: aistudio.google.com/apikey)
+# in the environment. Two calls with the one key: a text model turns the
+# script into a thumbnail concept + <=3-word on-image text, then an image
+# model renders a 16:9 HD thumbnail. Without the key the job fails with a
+# clear "not configured" message — the manual editor keeps working.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+GEMINI_TEXT_MODEL = "gemini-2.0-flash"
+GEMINI_IMAGE_MODELS = ("gemini-2.5-flash-image", "gemini-2.0-flash-preview-image-generation")
+
+def _gemini_generate(model: str, payload: dict, timeout: int = 120) -> dict:
+    req = urllib.request.Request(
+        f"{GEMINI_BASE}/{model}:generateContent?key={GEMINI_API_KEY}",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _gemini_concept(script_text: str) -> dict:
+    """Script -> {image_prompt, thumbnail_text} via the Gemini text model."""
+    instruction = (
+        "You are a YouTube thumbnail designer. Read this video script and return "
+        "ONLY valid JSON (no markdown fences) with two keys:\n"
+        '- "thumbnail_text": the on-image text, MAX 3 words, ALL CAPS, punchy.\n'
+        '- "image_prompt": a detailed image-generation prompt for a viral YouTube '
+        "thumbnail: one dramatic main subject with an exaggerated emotional "
+        "expression or a striking scene from the script, cinematic lighting, "
+        "vivid saturated colors, ultra high contrast, clean composition with the "
+        "subject on one side and copy space on the other, photorealistic, 16:9. "
+        "The image itself must contain NO text, letters or words (text is added "
+        "later by the editor).\n\nSCRIPT:\n"
+    )
+    data = _gemini_generate(GEMINI_TEXT_MODEL, {
+        "contents": [{"parts": [{"text": instruction + script_text[:5000]}]}],
+    })
+    text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text).strip()
+    concept = json.loads(text)
+    if not concept.get("image_prompt"):
+        raise ValueError("Gemini returned no image prompt")
+    concept["thumbnail_text"] = str(concept.get("thumbnail_text", ""))[:40]
+    return concept
+
+
+def _gemini_image(image_prompt: str) -> tuple:
+    """Render the thumbnail image; returns (base64_data, mime_type)."""
+    last_exc = None
+    for model in GEMINI_IMAGE_MODELS:
+        for with_config in (True, False):
+            payload = {"contents": [{"parts": [{"text": image_prompt}]}]}
+            if with_config:
+                payload["generationConfig"] = {
+                    "responseModalities": ["TEXT", "IMAGE"],
+                    "imageConfig": {"aspectRatio": "16:9"},
+                }
+            else:
+                payload["generationConfig"] = {"responseModalities": ["TEXT", "IMAGE"]}
+            try:
+                data = _gemini_generate(model, payload, timeout=180)
+                parts = data["candidates"][0]["content"]["parts"]
+                for part in parts:
+                    inline = part.get("inlineData") or part.get("inline_data")
+                    if inline and inline.get("data"):
+                        return inline["data"], inline.get("mimeType", "image/png")
+                raise ValueError("Gemini returned no image")
+            except Exception as exc:  # try the next model/config combo
+                last_exc = exc
+                continue
+    raise RuntimeError(f"Gemini image generation failed ({type(last_exc).__name__}).")
+
+
+def _run_thumb_job(job_id: str, script_text: str) -> None:
+    _set_job(job_id, status="running")
+    try:
+        if not GEMINI_API_KEY:
+            raise RuntimeError(
+                "AI thumbnails are not configured yet. Add a free Gemini API key "
+                "as GEMINI_API_KEY (Google AI Studio → Get API key; on Render: "
+                "service → Environment) and try again. The manual editor below "
+                "works without it."
+            )
+        _set_job(job_id, status="running", progress="Designing the thumbnail concept…")
+        concept = _gemini_concept(script_text)
+        _set_job(job_id, status="running", progress="Rendering the HD image…")
+        b64, mime = _gemini_image(concept["image_prompt"])
+        _set_job(job_id, status="done", result={
+            "image_data_url": f"data:{mime};base64,{b64}",
+            "thumbnail_text": concept["thumbnail_text"],
+            "image_prompt": concept["image_prompt"],
+            "engine": "gemini",
+        })
+        logger.info("Thumbnail job %s done", job_id)
+    except Exception as exc:
+        logger.error("Thumbnail job %s failed: %s", job_id, type(exc).__name__)
+        _set_job(job_id, status="error",
+                 error=str(exc) if isinstance(exc, RuntimeError) else
+                 "Could not generate the thumbnail. Please try again.")
+
+
+@app.post("/api/jobs/thumbnail-ai")
+async def thumbnail_ai(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Invalid JSON body."})
+    script_text = str(body.get("script", "")).strip()
+    if not (30 <= len(script_text) <= 8000):
+        return JSONResponse(
+            status_code=400, content={"ok": False, "error": "script must be 30–8000 characters — paste your video script."},
+        )
+    ip = get_client_ip(request)
+    if rate_limited((ip, "jobs/thumbnail-ai"), 10):
+        return _rate_limit_response(10)
+    job_id = _new_job("thumbnail")
+    thread = threading.Thread(target=_run_thumb_job, args=(job_id, script_text), daemon=True)
+    thread.start()
+    return JSONResponse(status_code=202, content={"job_id": job_id})
+
+
+# ----------------------------------------------------------------------------
+# Library — saved scripts & analyses (auth required)
+# ----------------------------------------------------------------------------
+LIBRARY_TYPES = ("script", "analysis", "voiceover")
+MAX_PAYLOAD_BYTES = 500 * 1024
+
+
+@app.get("/api/library")
+async def library_list(request: Request):
+    email = get_session_email(request)
+    if not email:
+        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+    with _db_lock, _db() as conn:
+        rows = conn.execute(
+            "SELECT id, type, title, created_at FROM library WHERE email = ? ORDER BY id DESC",
+            (email,),
+        ).fetchall()
+    return {"items": [dict(r) for r in rows]}
+
+
+@app.get("/api/library/{item_id}")
+async def library_get(item_id: int, request: Request):
+    email = get_session_email(request)
+    if not email:
+        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+    with _db_lock, _db() as conn:
+        row = conn.execute(
+            "SELECT id, type, title, payload, created_at FROM library WHERE id = ? AND email = ?",
+            (item_id, email),
+        ).fetchone()
+    if row is None:
+        return JSONResponse(status_code=404, content={"error": "Item not found."})
+    item = dict(row)
+    item["payload"] = json.loads(item["payload"])
+    return {"item": item}
+
+
+@app.post("/api/library")
+async def library_add(request: Request):
+    email = get_session_email(request)
+    if not email:
+        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Invalid JSON body."})
+    item_type = str(body.get("type", "")).strip()
+    title = str(body.get("title", "")).strip()
+    payload = body.get("payload")
+
+    if item_type not in LIBRARY_TYPES:
+        return JSONResponse(
+            status_code=400, content={"ok": False, "error": "type must be 'script' or 'analysis'."}
+        )
+    if not (1 <= len(title) <= 200):
+        return JSONResponse(
+            status_code=400, content={"ok": False, "error": "title must be 1–200 characters."}
+        )
+    if not isinstance(payload, dict):
+        return JSONResponse(
+            status_code=400, content={"ok": False, "error": "payload must be a JSON object."}
+        )
+    payload_str = json.dumps(payload, ensure_ascii=False)
+    if len(payload_str.encode("utf-8")) > MAX_PAYLOAD_BYTES:
+        return JSONResponse(
+            status_code=400, content={"ok": False, "error": "payload exceeds 500KB."}
+        )
+
+    with _db_lock, _db() as conn:
+        if USE_POSTGRES:
+            row = conn.execute(
+                "INSERT INTO library (email, type, title, payload, created_at)"
+                " VALUES (?, ?, ?, ?, ?) RETURNING id",
+                (email, item_type, title, payload_str, now_ts()),
+            ).fetchone()
+            item_id = row["id"]
+        else:
+            cur = conn.execute(
+                "INSERT INTO library (email, type, title, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+                (email, item_type, title, payload_str, now_ts()),
+            )
+            item_id = cur.lastrowid
+    return {"ok": True, "id": item_id}
+
+
+@app.delete("/api/library/{item_id}")
+async def library_delete(item_id: int, request: Request):
+    email = get_session_email(request)
+    if not email:
+        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+    with _db_lock, _db() as conn:
+        cur = conn.execute(
+            "DELETE FROM library WHERE id = ? AND email = ?",
+            (email, item_id),
+        )
+    if cur.rowcount == 0:
+        return JSONResponse(status_code=404, content={"error": "Item not found."})
+    return {"ok": True}
+
+
+# ----------------------------------------------------------------------------
+# POST /api/jobs/channel-data — ChannelRecipe-style CHANNEL DATA JSON
+# ----------------------------------------------------------------------------
+# Returns exactly the reference shape: metadata{channel_name, channel_id,
+# subscribers, total_views, video_count}, videos[]{video_id, title,
+# published_at, views, likes, comments, duration (ISO 8601)},
+# transcripts[]{title, video_id, text (capped at 5000 chars)},
+# transcript_status{requested, fetched, warning}.
+#
+# Data sources, in order:
+#  1) YouTube Data API v3 (YOUTUBE_API_KEY, free) — the reliable route:
+#     channels.list + uploads playlist + videos.list return real subscriber
+#     totals, views, likes, comments and publish dates from any server.
+#  2) yt-dlp tab fetch (no key) — titles + durations only; stats stay null
+#     because watch-page extraction is walled from datacenter IPs, and the
+#     result carries a data_note saying so.
+# Transcripts are always best-effort via yt-dlp captions (same wall applies).
+# The key is read fresh on every call so a key added later (Render env var)
