@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 # ffmpeg is required for audio conversion (voiceover jobs produce mp3)
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get install -y --no-install-recommends ffmpeg curl \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -29,7 +29,7 @@ RUN mkdir -p /app/voices \
       ; done \
     && ls -la /app/voices
 # Build-time smoke test: fails the build if piper/espeak data is broken
-RUN echo "This is a smoke test." | piper --model /app/voices/en_US-amy-medium.onnx --config /app/voices/en_US-amy-medium.onnx.json --output_file /tmp/smoke.wav && test -s /tmp/smoke.wav && rm /tmp/smoke.wav
+RUN echo "This is a smoke test." | python -m piper --model /app/voices/en_US-amy-medium.onnx --config /app/voices/en_US-amy-medium.onnx.json --output_file /tmp/smoke.wav && test -s /tmp/smoke.wav && rm /tmp/smoke.wav
 
 COPY . .
 
