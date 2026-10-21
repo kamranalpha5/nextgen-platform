@@ -521,3 +521,264 @@ def _collect_video_entries(data: dict, max_videos: int) -> list:
     """Flatten yt-dlp's tab/playlist nesting into a list of video entry dicts.
 
     A channel URL yields tab sub-playlists (Videos / Live / Shorts) whose
+    entries are the real videos; a plain playlist/watch URL yields video
+    entries directly (or a single video dict with no 'entries' key).
+    """
+    raw = [e for e in (data.get("entries") or []) if e]
+
+    # Prefer the "Videos" tab for channel URLs.
+    tab = None
+    for e in raw:
+        nested = [x for x in (e.get("entries") or []) if x]
+        if nested and e.get("_type") == "playlist":
+            if "videos" in (e.get("title") or "").lower():
+                tab = nested
+                break
+    if tab is None:
+        # No Videos tab: merge whatever we find (plain playlists, watch URLs).
+        tab = []
+        for e in raw:
+            nested = [x for x in (e.get("entries") or []) if x]
+            if nested and e.get("_type") == "playlist":
+                tab.extend(nested)
+            else:
+                tab.append(e)
+    if not tab and data.get("id") and data.get("_type") in (None, "video"):
+        tab = [data]  # single video URL, no 'entries' wrapper
+    return tab[:max_videos]
+
+
+def _enrich_views(videos: list, timeout_per: int = 30, workers: int = 5) -> None:
+    """Best-effort view-count enrichment.
+
+    --flat-playlist entries don't carry view counts, so fetch each video's
+    view_count with a lightweight per-video yt-dlp call, in parallel.
+    Datacenter IPs are walled for some player clients, so each video is
+    tried on android, then ios, then web; failures are ignored — views
+    simply stay None.
+    """
+    def fetch(video: dict) -> None:
+        for client in ("android", "ios", "web"):
+            try:
+                proc = subprocess.run(
+                    [sys.executable, "-m", "yt_dlp",
+                     "--no-playlist", "--no-warnings",
+                     "--print", "%(view_count)s",
+                     "--print", "%(upload_date)s",
+                     "--extractor-args", f"youtube:player_client={client}",
+                     video["url"]],
+                    capture_output=True, text=True, timeout=timeout_per,
+                )
+                out = [ln.strip() for ln in (proc.stdout or "").strip().splitlines()]
+                got = False
+                if out and out[0].isdigit():
+                    video["views"] = int(out[0])
+                    got = True
+                if len(out) > 1 and len(out[1]) == 8 and out[1].isdigit() \
+                        and not video.get("upload_date"):
+                    video["upload_date"] = out[1]
+                    video["date"] = f"{out[1][:4]}-{out[1][4:6]}-{out[1][6:8]}"
+                    got = True
+                if got:
+                    return
+            except Exception:
+                continue
+
+    pending = [v for v in videos if v.get("views") is None or not v.get("upload_date")]
+    if not pending:
+        return
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(fetch, pending))
+
+
+def _parse_analyze(data: dict, max_videos: int) -> dict:
+    videos = []
+    for e in _collect_video_entries(data, max_videos):
+        vid = e.get("id")
+        if not vid or e.get("_type") == "playlist":
+            continue  # skip private/deleted (null) and stray playlists
+        upload_date = e.get("upload_date")
+        ts = e.get("timestamp")
+        if not upload_date and isinstance(ts, (int, float)):
+            upload_date = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y%m%d")
+        videos.append(
+            {
+                "id": vid,
+                "title": e.get("title") or "Untitled",
+                "url": f"https://www.youtube.com/watch?v={vid}",
+                "views": e.get("view_count"),
+                "duration": e.get("duration"),
+                "upload_date": upload_date,
+                # Frontend-friendly aliases:
+                "date": (
+                    f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:8]}"
+                    if upload_date and len(upload_date) == 8 and upload_date.isdigit()
+                    else upload_date
+                ),
+            }
+        )
+    channel = data.get("channel") or data.get("uploader") or ""
+    channel_id = data.get("channel_id") or data.get("id") or ""
+    followers = data.get("channel_follower_count")
+
+    return {
+        "channel": {
+            "name": channel,
+            "id": channel_id,
+            # Aliases the frontend reads:
+            "handle": channel_id,
+            "subscribers": followers,
+            "follower_count": followers,
+            "url": data.get("channel_url") or data.get("webpage_url"),
+        },
+        "videos": videos,
+    }
+
+
+def _build_insights(videos: list) -> dict:
+    views_list = [v["views"] for v in videos if isinstance(v.get("views"), (int, float))]
+    avg_views = round(sum(views_list) / len(views_list)) if views_list else 0
+    top = max(views_list and videos, key=lambda v: v.get("views") or -1) if views_list else None
+
+    durations = [v["duration"] for v in videos if isinstance(v.get("duration"), (int, float))]
+    if not durations:
+        cadence_note = (
+            f"Analyzed the {len(videos)} most recent videos; duration data was not "
+            "available, so a cadence estimate can't be made from this sample."
+        )
+    else:
+        avg_min = sum(durations) / len(durations) / 60
+        if avg_min < 3:
+            cadence_note = (
+                f"Short-form leaning channel — the latest {len(videos)} videos average "
+                f"{avg_min:.1f} min. Typical of Shorts/clip-style faceless channels; "
+                "volume and hooks matter more than depth here."
+            )
+        elif avg_min < 12:
+            cadence_note = (
+                f"Mid-length format — the latest {len(videos)} videos average {avg_min:.1f} min, "
+                "a proven sweet spot for faceless documentary/explainer content with strong retention."
+            )
+        else:
+            cadence_note = (
+                f"Long-form channel — the latest {len(videos)} videos average {avg_min:.1f} min. "
+                "Long-form builds watch-time but needs strong retention hooks every 2–3 minutes."
+            )
+
+    return {
+        "video_count": len(videos),
+        "avg_views": avg_views,
+        "top_video": (
+            {"title": top["title"], "views": top["views"], "url": top["url"]} if top else None
+        ),
+        "cadence_note": cadence_note,
+    }
+
+
+def _run_analyze_job(job_id: str, url: str, max_videos: int, cache_key: str) -> None:
+    _set_job(job_id, status="running")
+    try:
+        # A video link resolves to its channel first — any video URL works.
+        url = _resolve_to_channel_url(url)
+        cmd = [
+            sys.executable, "-m", "yt_dlp",
+            "--flat-playlist", "--dump-single-json",
+            "--playlist-end", str(max_videos),
+            "--extractor-args", "youtube:player_client=android",
+            "--no-warnings",
+            url,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+        if proc.returncode != 0:
+            tail = (proc.stderr or "").strip().splitlines()
+            hint = tail[-1] if tail else "yt-dlp failed"
+            raise RuntimeError(
+                "Could not read that channel — it may be private, age-restricted, "
+                f"or the URL is wrong. ({hint[:160]})"
+            )
+        data = json.loads(proc.stdout or "{}")
+        result = _parse_analyze(data, max_videos)
+        # Prefer the human @handle from the submitted URL when present.
+        m = re.search(r"youtube\.com/@([^/?#]+)", url)
+        if m:
+            result["channel"]["handle"] = "@" + m.group(1)
+        if not result["videos"]:
+            raise RuntimeError(
+                "No public videos found at that URL. Check the link and try again."
+            )
+        # Flat-playlist entries don't carry view counts — enrich best-effort,
+        # then compute insights from the enriched videos.
+        _enrich_views(result["videos"])
+        result["insights"] = _build_insights(result["videos"])
+        # Alias the frontend reads for the stats row:
+        result["stats"] = result["insights"]
+        cache_put("analyze", cache_key, result, ttl=3600)
+        _set_job(job_id, status="done", result=result)
+        logger.info("Analyze job %s done: %d videos", job_id, len(result["videos"]))
+    except subprocess.TimeoutExpired:
+        _set_job(job_id, status="error",
+                 error="The channel took too long to read. Try again with fewer videos.")
+    except Exception as exc:
+        logger.error("Analyze job %s failed: %s", job_id, type(exc).__name__)
+        _set_job(job_id, status="error",
+                 error=str(exc) if isinstance(exc, RuntimeError) else
+                 "Something went wrong while analyzing. Please try again.")
+
+
+@app.post("/api/jobs/analyze")
+async def analyze(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Invalid JSON body."})
+    url = str(body.get("youtube_url", "")).strip()
+    max_videos = body.get("max_videos", 10)
+    if not isinstance(max_videos, int) or not (5 <= max_videos <= 50):
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": "max_videos must be an integer between 5 and 50."},
+        )
+    if not url or not YOUTUBE_URL_RE.match(url):
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False,
+                     "error": "That doesn't look like a YouTube channel/video/playlist URL "
+                              "(expected youtube.com/@handle, /channel/, /c/, watch or playlist link)."},
+        )
+
+    ip = get_client_ip(request)
+    if rate_limited((ip, "jobs/analyze"), 5):
+        return _rate_limit_response(5)
+
+    normalized = url.rstrip("/").lower()
+    cache_key = f"{normalized}|{max_videos}"
+    cached = cache_get("analyze", cache_key)
+    job_id = _new_job("analyze")
+    if cached is not None:
+        _set_job(job_id, status="done", result=cached)
+        return JSONResponse(status_code=202, content={"job_id": job_id})
+
+    thread = threading.Thread(
+        target=_run_analyze_job, args=(job_id, url, max_videos, cache_key), daemon=True
+    )
+    thread.start()
+    return JSONResponse(status_code=202, content={"job_id": job_id})
+
+
+@app.get("/api/jobs/{job_id}")
+async def job_status(job_id: str):
+    job = _get_job(job_id)
+    if job is None:
+        return JSONResponse(status_code=404, content={"error": "Job not found."})
+    return {"status": job["status"], "result": job["result"], "error": job["error"],
+            "progress": job.get("progress")}
+
+
+@app.get("/api/jobs/{job_id}/download")
+async def job_download(job_id: str):
+    job = _get_job(job_id)
+    if job is None:
+        return JSONResponse(status_code=404, content={"error": "Job not found."})
+    if job["kind"] not in ("analyze", "full") or job["status"] != "done":
+        return JSONResponse(
+            status_code=400,
