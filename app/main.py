@@ -1305,3 +1305,263 @@ _BEAT_HEADINGS = {
     "sports": ["The Underdog", "The Climb", "The Defining Moment", "The Price of Glory", "The Legacy"],
     "essay": ["The Surface", "The Contradiction", "The Deeper Pattern", "The Uncomfortable Truth", "The Reflection"],
 }
+
+_OPENERS = {
+    "documentary": [
+        "To understand {t}, you have to see it the way the cameras never show you — from the inside out.",
+        "Every story about {t} starts in the same place: with a detail almost everyone overlooks.",
+        "Strip away the headlines about {t}, and what you're left with is far more fascinating.",
+    ],
+    "explainer": [
+        "Let's start with the simplest possible definition of {t} — then build from there.",
+        "Most explanations of {t} overcomplicate it. Here's the version that actually makes sense.",
+        "Before we go any deeper, let's make sure we're on the same page about what {t} really is.",
+    ],
+    "history": [
+        "To understand {t}, we have to go back — long before it became what it is today.",
+        "The story of {t} doesn't begin where the textbooks say it does.",
+        "History remembers {t} one way. The truth is messier, stranger, and far more interesting.",
+    ],
+    "true_crime": [
+        "It started, as these stories often do, with something that seemed completely ordinary about {t}.",
+        "Nobody suspected a thing about {t} — and that was exactly the problem.",
+        "The first sign that something was wrong with {t} was easy to miss. Almost everyone did.",
+    ],
+    "sports": [
+        "Every legend has an origin story, and the one behind {t} is wilder than you think.",
+        "Long before the trophies and the headlines, {t} was just a long shot nobody believed in.",
+        "Ask anyone about {t} today and they'll tell you the ending. Almost nobody knows the beginning.",
+    ],
+    "essay": [
+        "On the surface, {t} seems simple enough. It isn't — and that's the point.",
+        "We talk about {t} constantly, yet we rarely stop to ask what it actually means.",
+        "There's a question hiding inside {t} that nobody wants to answer honestly.",
+    ],
+}
+
+_MIDDLES = {
+    "documentary": [
+        "The deeper researchers dug into {t}, the more the official narrative started to crack.",
+        "What makes {t} so compelling isn't the spectacle — it's the quiet moments nobody filmed.",
+        "Experts who have spent decades studying {t} still disagree about what it all means.",
+        "Follow the money, follow the power, follow the silence — and {t} starts to make sense.",
+        "The people closest to {t} describe it in terms that never make it into the documentaries.",
+        "Every frame of archival footage about {t} hides a detail that changes the story.",
+        "What the cameras captured about {t} is only half the story — the rest was whispered.",
+        "New evidence about {t} keeps surfacing, and each piece rewrites what came before.",
+        "The official timeline of {t} has gaps — and the gaps are where the truth lives.",
+        "Nobody who witnessed {t} firsthand ever described it the same way twice.",
+    ],
+    "explainer": [
+        "Here's the mechanism behind {t}, step by step, with nothing skipped.",
+        "Think of {t} like this: once you see the pattern, you can't unsee it.",
+        "The key insight about {t} is surprisingly simple — but it changes everything.",
+        "Most people get {t} wrong because they start from the wrong assumption.",
+        "Let's test this with a concrete example of {t} in the real world.",
+        "And this is where {t} gets genuinely interesting — the part textbooks gloss over.",
+        "Once you grasp this one idea, the rest of {t} falls into place naturally.",
+        "Here's a quick mental model for {t} you can use forever.",
+        "The exceptions to the rule reveal the most about how {t} truly works.",
+        "If you remember one thing about {t}, make it this.",
+    ],
+    "history": [
+        "The records from that era paint a picture of {t} that feels almost unreal today.",
+        "What happened next would reshape {t} — and echo for generations.",
+        "The people who lived through the story of {t} left accounts that still give historians chills.",
+        "For years, the truth about {t} was buried — until one discovery changed everything.",
+        "Power, ambition, and fear collided, and {t} would never be the same again.",
+        "The documents tell one story about {t}; the survivors tell another.",
+        "What the victors wrote about {t} served their interests — not the truth.",
+        "A single letter, diary, or artifact about {t} rewrote the accepted narrative.",
+        "The turning point in the story of {t} came down to one fateful decision.",
+        "Ordinary people caught in the story of {t} showed extraordinary courage.",
+    ],
+    "true_crime": [
+        "Investigators looking into {t} quickly realized nothing was what it seemed.",
+        "The evidence didn't add up — and the gaps in the story of {t} were the loudest part.",
+        "Witnesses described {t} in ways that contradicted each other completely.",
+        "Then came the breakthrough: a single detail about {t} that cracked the case open.",
+        "The deeper the investigation into {t} went, the darker the picture became.",
+        "To this day, experts still debate what really happened with {t}.",
+        "A witness came forward years later with a detail about {t} that changed everything.",
+        "The forensics told a story about {t} that nobody wanted to believe.",
+        "Every alibi in the story of {t} had a crack — investigators just had to find it.",
+        "The motive behind {t} was hiding in plain sight the entire time.",
+    ],
+    "sports": [
+        "The training, the sacrifices, the setbacks — the road behind {t} was brutal.",
+        "Critics wrote off {t} more times than anyone can count. They were wrong every time.",
+        "What separated {t} from everyone else wasn't talent — it was something harder to measure.",
+        "The moment everything changed for {t} happened in front of millions, in seconds.",
+        "Behind every highlight of {t} there are a hundred hours nobody ever sees.",
+        "Rivals still talk about facing {t} like it was a force of nature.",
+        "The stadium fell silent the moment {t} proved every doubter wrong.",
+        "Teammates say the work ethic behind {t} bordered on obsession.",
+        "One play, one race, one moment — that's all it took to define {t}.",
+        "The comeback story of {t} is the stuff Hollywood wishes it could invent.",
+    ],
+    "essay": [
+        "The paradox at the heart of {t} is this: the more we discuss it, the less we understand it.",
+        "Look closely at {t} and you'll see our own reflection staring back.",
+        "We tell ourselves comforting stories about {t} — but the data tells a different one.",
+        "The uncomfortable truth about {t} is that it reveals more about us than about itself.",
+        "Every generation reinterprets {t}, and every generation thinks it finally got it right.",
+        "What if everything we assume about {t} is backwards? Let's find out.",
+        "The language we use to describe {t} shapes what we're allowed to conclude.",
+        "Strip away the noise around {t} and a simpler, harder truth remains.",
+        "We consume stories about {t} the way we consume everything: too fast to digest.",
+        "Perhaps the real question about {t} is why we're so afraid to ask it.",
+    ],
+}
+
+_CLOSERS = {
+    "documentary": [
+        "And that is the real story of {t} — not the myth, but the truth underneath it.",
+        "The cameras moved on from {t} long ago. The story didn't end, though.",
+        "What happens next with {t} is still being written — and it's worth watching.",
+    ],
+    "explainer": [
+        "So that's {t} — demystified, step by step, with nothing left vague.",
+        "Now that you see how {t} works, you'll notice it everywhere.",
+        "And that's the whole picture of {t} — simple once you know where to look.",
+    ],
+    "history": [
+        "History doesn't repeat with {t} — but it rhymes, if you're listening.",
+        "The past never really stays buried when it comes to {t}.",
+        "And so the story of {t} becomes a warning — and a lesson — for all of us.",
+    ],
+    "true_crime": [
+        "Justice, in the story of {t}, was anything but simple.",
+        "The case of {t} closed — but the questions never really did.",
+        "Some stories about {t} end with answers. This one ends with a warning.",
+    ],
+    "sports": [
+        "That's the legacy of {t} — not just wins, but what those wins cost.",
+        "Long after the crowds go home, the story of {t} still inspires.",
+        "Greatness fades. What {t} taught us doesn't.",
+    ],
+    "essay": [
+        "Maybe {t} was never really about {t} at all.",
+        "The question isn't what {t} means — it's what we're going to do about it.",
+        "And that, in the end, is what {t} forces us to confront.",
+    ],
+}
+
+
+_VISUALS = {
+    "documentary": [
+        "Slow cinematic B-roll related to {t}: shallow depth of field, muted grade, subtle film grain.",
+        "Archival-style footage and maps connected to {t}, with slow push-in and lower-third labels.",
+        "Aerial drone-style establishing shots evoking the world of {t}, cross-dissolve transitions.",
+        "Close-up detail shots — textures, documents, faces — tied to {t}, with soft vignette.",
+    ],
+    "explainer": [
+        "Clean motion-graphics diagram breaking down {t}, bold sans-serif labels, brand colors.",
+        "Animated timeline/flowchart illustrating the key mechanism of {t}, step-by-step reveals.",
+        "Split-screen comparison showing {t} versus the common misconception, with icons.",
+        "Whiteboard-style sketch animation simplifying {t} into three visual chunks.",
+    ],
+    "history": [
+        "Sepia-toned reenactment-style stills and paintings depicting the era of {t}, slow Ken Burns pan.",
+        "Vintage maps and documents about {t}, camera drifting across aged paper textures.",
+        "Dramatic silhouette imagery and fog overlays evoking the darker chapters of {t}.",
+        "Timeline animation marking the key dates in the story of {t}, parchment background.",
+    ],
+    "true_crime": [
+        "Dark, desaturated B-roll with crime-board aesthetics: red string, pinned photos about {t}.",
+        "Night-time city footage with slow zoom, overlaid with case-file style text about {t}.",
+        "Grainy, high-contrast imagery suggesting the investigation into {t}, flash-frame cuts.",
+        "Map animation tracing movements and locations tied to {t}, with pulsing markers.",
+    ],
+    "sports": [
+        "High-energy montage of athletic imagery tied to {t}: slow-motion, speed ramps, lens flares.",
+        "Stadium crowd B-roll with rising audio swell, building toward the story of {t}.",
+        "Training-ground footage — sweat, repetition, grit — mirroring the journey of {t}.",
+        "Trophy-lift style hero shot composition celebrating the legacy of {t}, golden-hour grade.",
+    ],
+    "essay": [
+        "Minimalist, contemplative B-roll — empty rooms, rain on glass — reflecting on {t}.",
+        "Slow typography animation of the key question about {t}, generous negative space.",
+        "Abstract visuals: ink in water, shifting shadows, mirroring the ambiguity of {t}.",
+        "Quiet observational footage of everyday life, reframed by the argument about {t}.",
+    ],
+}
+
+_CTAS = {
+    "dramatic": "If this opened your eyes, subscribe — because the next story goes even deeper.",
+    "educational": "Subscribe for clear, no-fluff breakdowns like this every single week.",
+    "casual": "If you learned something, hit subscribe — way more rabbit holes where this came from.",
+    "mysterious": "Subscribe — some stories are too strange to miss, and this was only the beginning.",
+}
+
+def _fill(template: str, topic: str) -> str:
+    t = topic.strip()
+    title_case = t[:1].upper() + t[1:] if t else t
+    # Lowercase lead-in for mid-sentence slots, but never mangle acronyms
+    # ("JFK assassination" must not become "jFK assassination").
+    if len(t) > 1 and t[0].isupper() and t[1].islower():
+        lower_lead = t[0].lower() + t[1:]
+    else:
+        lower_lead = t
+    return template.replace("{T}", title_case).replace("{t}", lower_lead)
+
+
+def template_script(topic: str, style: str, tone: str, length_min: int) -> dict:
+    """Deterministic, style/tone-adapted script. Topic woven into every beat."""
+    words_total = length_min * 140
+    n_beats = 3 if length_min <= 4 else 4 if length_min <= 10 else 5
+    words_per_beat = max(60, words_total // n_beats)
+    headings = _BEAT_HEADINGS[style][:n_beats]
+
+    title = _pick(_TITLES[style], f"{topic}|title").replace("{T}", topic.strip()).replace("{M}", str(length_min))
+    hook = _pick(_HOOKS[tone], f"{topic}|hook|{tone}")
+    hook = _fill(hook, topic)
+
+    beats = []
+    for i, heading in enumerate(headings):
+        seed = f"{topic}|{style}|{i}"
+        parts = [_fill(_pick(_OPENERS[style], seed + "|op"), topic)]
+        # Add middle sentences until we hit the word target. Sentences are not
+        # repeated within a beat until the bank is exhausted; after that,
+        # reuse is allowed but never back-to-back.
+        bank_size = len(_MIDDLES[style])
+        used = set(parts)
+        last = parts[-1]
+        bank_exhausted = False
+        j = 0
+        guard = 0
+        # Scale the per-beat sentence cap with the word target so long scripts
+        # stay proportional (spaced reuse kicks in past the unique bank).
+        max_middles = min(40, max(16, words_per_beat // 18))
+        while sum(len(p.split()) for p in parts) < words_per_beat and j < max_middles and guard < 600:
+            guard += 1
+            if not bank_exhausted and len(used) > bank_size:
+                bank_exhausted = True  # from here: reuse allowed, just never back-to-back
+            cand = _fill(_pick(_MIDDLES[style], f"{seed}|mid|{j}|try{guard}"), topic)
+            if cand == last or (not bank_exhausted and cand in used):
+                continue
+            used.add(cand)
+            last = cand
+            parts.append(cand)
+            j += 1
+        parts.append(_fill(_pick(_CLOSERS[style], seed + "|cl"), topic))
+        narration = " ".join(parts)
+        beats.append({
+            "heading": f"{heading}: {topic.strip()}",
+            "narration": narration,
+            "visual_note": _fill(_pick(_VISUALS[style], seed + "|vis"), topic),
+        })
+
+    return {
+        "title": title,
+        "hook": hook,
+        "beats": beats,
+        "cta": _CTAS[tone],
+    }
+
+def _run_script_job(job_id: str, topic: str, style: str, tone: str, length_min: int) -> None:
+    _set_job(job_id, status="running")
+    engine = "template"
+    try:
+        if HF_API_TOKEN:
+            try:
