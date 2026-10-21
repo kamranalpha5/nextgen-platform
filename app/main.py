@@ -782,3 +782,264 @@ async def job_download(job_id: str):
     if job["kind"] not in ("analyze", "full") or job["status"] != "done":
         return JSONResponse(
             status_code=400,
+            content={"ok": False, "error": "Download is only available for completed analysis jobs."},
+        )
+    payload = json.dumps(job["result"], indent=2, ensure_ascii=False).encode("utf-8")
+    fname = "channel_channel_data.json" if job["kind"] == "full" else "channel-analysis.json"
+    return FileResponse(
+        path=_write_temp_download(job_id, payload),
+        media_type="application/json",
+        filename=fname,
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+def _write_temp_download(job_id: str, payload: bytes) -> str:
+    tmp = DATA_DIR / f"download-{job_id}.json"
+    tmp.write_bytes(payload)
+    return str(tmp)
+
+
+# ----------------------------------------------------------------------------
+# POST /api/jobs/analyze-full — deep channel export
+# ----------------------------------------------------------------------------
+# Produces the full research package for a channel:
+#   metadata    {channel_name, channel_id, subscribers, total_views, video_count}
+#   videos[]    {video_id, title, published_at, views, likes, comments, duration}
+#               for the last N (50–100) videos — views + dates included
+#   outliers[]  videos performing far above the channel median
+#   transcripts[]  full caption text for the top-5 and bottom-3 videos by views
+#   transcript_status {requested, fetched, warning}
+#   top_comments[]   top comments on the best videos, next-film requests flagged
+#   next_film_requests[]  flattened audience asks for a next film
+# ----------------------------------------------------------------------------
+
+def _iso_duration(seconds) -> str | None:
+    """Seconds -> ISO-8601 duration (PT#H#M#S), YouTube API style."""
+    if not isinstance(seconds, (int, float)) or seconds < 0:
+        return None
+    total = int(round(seconds))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    out = "PT"
+    if h:
+        out += f"{h}H"
+    if m:
+        out += f"{m}M"
+    if s or out == "PT":
+        out += f"{s}S"
+    return out
+
+
+def _iso_published(entry: dict) -> str | None:
+    """yt-dlp entry -> ISO-8601 UTC timestamp (YYYY-MM-DDTHH:MM:SSZ)."""
+    ts = entry.get("timestamp")
+    if isinstance(ts, (int, float)) and ts > 0:
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ud = entry.get("upload_date")
+    if ud and len(str(ud)) == 8 and str(ud).isdigit():
+        return f"{ud[:4]}-{ud[4:6]}-{ud[6:8]}T00:00:00Z"
+    return None
+
+
+def _ytdlp_info(url: str, extra_args: list, timeout: int = 60) -> dict | None:
+    """Run yt-dlp -J for one URL; parsed dict or None on any failure."""
+    cmd = [sys.executable, "-m", "yt_dlp", "--no-playlist", "--no-warnings",
+           "-J"] + extra_args + [url]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if proc.returncode != 0 or not proc.stdout:
+            return None
+        return json.loads(proc.stdout)
+    except Exception:
+        return None
+
+
+def _fetch_video_full(video_id: str) -> dict | None:
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    info = _ytdlp_info(url, ["--extractor-args", "youtube:player_client=android"],
+                       timeout=45)
+    if info is None:  # fall back to the default client once
+        info = _ytdlp_info(url, [], timeout=45)
+    return info
+
+
+_NEXT_FILM_RE = re.compile(
+    r"(next\s+(film|movie|video|part|episode|chapter)|part\s*(2|two|ii)\b|sequel|"
+    r"another\s+(one|film|movie|video)|please\s+make|make\s+(a\s+)?(next|another)|"
+    r"waiting\s+for|continue\s+(the\s+)?(story|film|movie)|more\s+like\s+this|"
+    r"next\s+one|bring\s+.*\s+back)",
+    re.IGNORECASE,
+)
+
+
+def _fetch_top_comments(video_id: str, limit: int = 30) -> list:
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    info = _ytdlp_info(
+        url,
+        ["--extractor-args",
+         f"youtube:comment_sort=top;max_comments={limit * 2}"],
+        timeout=90,
+    )
+    if not info:
+        return []
+    out = []
+    for c in (info.get("comments") or []):
+        text = (c.get("text") or "").strip()
+        if not text:
+            continue
+        out.append({
+            "author": c.get("author") or "",
+            "text": text[:600],
+            "likes": c.get("like_count") or 0,
+            "is_next_film_request": bool(_NEXT_FILM_RE.search(text)),
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _fetch_transcript(video_id: str) -> str | None:
+    """Best-effort caption text (manual or auto subs, English first)."""
+    import html
+    import tempfile
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    with tempfile.TemporaryDirectory() as td:
+        cmd = [sys.executable, "-m", "yt_dlp", "--skip-download", "--no-playlist",
+               "--no-warnings", "--write-auto-subs", "--write-subs",
+               "--sub-langs", "en.*", "--sub-format", "vtt",
+               "--extractor-args", "youtube:player_client=android",
+               "-o", os.path.join(td, "%(id)s.%(ext)s"), url]
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        except Exception:
+            return None
+        vtts = sorted(Path(td).glob("*.vtt"))
+        if not vtts:
+            return None
+        raw = vtts[0].read_text(encoding="utf-8", errors="ignore")
+    lines, seen_last = [], None
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith(("WEBVTT", "Kind:", "Language:", "NOTE")):
+            continue
+        if "-->" in line or re.fullmatch(r"\d+", line):
+            continue
+        line = html.unescape(re.sub(r"<[^>]+>", "", line)).strip()
+        if line and line != seen_last:
+            lines.append(line)
+            seen_last = line
+    text = "\n".join(lines).strip()
+    return text or None
+
+
+_VIDEO_URL_RE = re.compile(
+    r"(?:youtube\.com/(?:watch\?[^#]*v=|shorts/|live/|embed/|v/)|youtu\.be/)"
+    r"([A-Za-z0-9_-]{6,})"
+)
+
+
+def _resolve_to_channel_url(url: str) -> str:
+    """Video link -> that video's channel /videos page; other URLs pass through.
+
+    Lets the analyzer accept any video link (watch, Shorts, youtu.be, live,
+    embed) and still return the COMPLETE channel JSON, not just that video.
+
+    Resolution order: YouTube's public oEmbed endpoint first (a plain HTTPS
+    GET — it answers from datacenter IPs where watch-page extraction is
+    walled), then yt-dlp watch-page info (android, then default client).
+    """
+    m = _VIDEO_URL_RE.search(url or "")
+    if not m:
+        return url
+    vid = m.group(1)
+    watch = f"https://www.youtube.com/watch?v={vid}"
+    # 1) oEmbed: no API key, no player extraction — just the author URL.
+    author_url = ""
+    try:
+        req = urllib.request.Request(
+            "https://www.youtube.com/oembed?url="
+            + urllib.parse.quote(watch, safe="") + "&format=json",
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            author_url = (json.loads(resp.read().decode("utf-8")) or {}).get("author_url") or ""
+    except Exception:
+        author_url = ""
+    if author_url:
+        cm = re.search(r"/channel/(UC[A-Za-z0-9_-]+)", author_url)
+        if cm:
+            return f"https://www.youtube.com/channel/{cm.group(1)}/videos"
+        # @handle: pin the channel ID when possible (the proven /channel/
+        # path); otherwise hand the handle's Videos tab to the job's tab
+        # fetch, which reads channel pages fine from servers.
+        handle_info = _ytdlp_info(
+            author_url, ["--extractor-args", "youtube:player_client=android"], timeout=45
+        )
+        cid = (handle_info or {}).get("channel_id") or (handle_info or {}).get("id") or ""
+        if isinstance(cid, str) and cid.startswith("UC"):
+            return f"https://www.youtube.com/channel/{cid}/videos"
+        return author_url.rstrip("/") + "/videos"
+    # 2) yt-dlp watch-page info (android, then default client).
+    info = _ytdlp_info(watch, ["--extractor-args", "youtube:player_client=android"],
+                       timeout=45)
+    if not (info or {}).get("channel_id") and not (info or {}).get("channel_url"):
+        alt = _ytdlp_info(watch, [], timeout=45)
+        if alt:
+            info = alt
+    if info:
+        cid = info.get("channel_id")
+        if cid:
+            return f"https://www.youtube.com/channel/{cid}/videos"
+        curl = info.get("channel_url") or info.get("uploader_url")
+        if curl:
+            return curl.rstrip("/") + "/videos"
+    raise RuntimeError(
+        "Could not find the channel for that video link. "
+        "Check the link and try again."
+    )
+
+
+def _run_full_job(job_id: str, url: str, max_videos: int, cache_key: str) -> None:
+    _set_job(job_id, status="running")
+    try:
+        # A video link resolves to its channel first — any video URL works.
+        url = _resolve_to_channel_url(url)
+        # 1) Flat channel fetch — ids + channel-level metadata.
+        videos_url = url.rstrip("/")
+        if not re.search(r"/(videos|streams|shorts)$", videos_url):
+            videos_url += "/videos"
+        cmd = [sys.executable, "-m", "yt_dlp", "--flat-playlist",
+               "--dump-single-json", "--playlist-end", str(max_videos),
+               "--extractor-args", "youtube:player_client=android",
+               "--no-warnings", videos_url]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+        if proc.returncode != 0:
+            tail = (proc.stderr or "").strip().splitlines()
+            hint = tail[-1] if tail else "yt-dlp failed"
+            raise RuntimeError(
+                "Could not read that channel — it may be private, age-restricted, "
+                f"or the URL is wrong. ({hint[:160]})"
+            )
+        data = json.loads(proc.stdout or "{}")
+        entries = _collect_video_entries(data, max_videos)
+        ids, seen = [], set()
+        for e in entries:
+            vid = e.get("id")
+            if vid and vid not in seen and e.get("_type") != "playlist":
+                seen.add(vid)
+                ids.append(vid)
+        if not ids:
+            raise RuntimeError("No public videos found at that URL. Check the link and try again.")
+
+        channel_name = data.get("channel") or data.get("uploader") or ""
+        channel_id = data.get("channel_id") or data.get("id") or ""
+        subscribers = data.get("channel_follower_count")
+        total_on_channel = None
+        for e in (data.get("entries") or []):
+            if isinstance(e, dict) and isinstance(e.get("playlist_count"), int):
+                total_on_channel = e["playlist_count"]
+                break
+
+        # 2) Full per-video extraction in parallel (views, dates, likes...).
+        _set_job(job_id, status="running", progress=f"Fetching details for {len(ids)} videos…")
