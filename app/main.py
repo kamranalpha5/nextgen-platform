@@ -2369,3 +2369,96 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run("app.main:app", host="0.0.0.0", port=PORT)
+
+# ----------------------------------------------------------------------------
+# Analyzer Data API upgrade (appended 2026-10-21).
+# The website's Channel Analyzer (POST /api/jobs/analyze) used to rely on a
+# yt-dlp flat-playlist fetch plus per-video watch-page enrichment, which is
+# walled on Render server IPs — so its downloaded JSON had views and
+# upload_date null and avg_views 0. When the Data API key is set, this
+# wrapper runs the analyze job from the Data API instead (same helpers as
+# the /channel-data job): real views, likes, comments and dates, in the SAME
+# result shape the SPA already renders (channel/videos/insights/stats), so
+# no frontend change is needed. Without a key, or on any API failure, it
+# falls back to the original yt-dlp job unchanged.
+# Implemented as a wrapper plus rebind (not a mid-file edit) so the change
+# ships as one safe append: the route resolves _run_analyze_job from module
+# globals at request time, after this module has fully loaded. Render runs
+# `uvicorn app.main:app` (import mode), so this rebind applies there.
+# ----------------------------------------------------------------------------
+
+
+def _parse_iso8601_duration(value):
+    """'PT1H18M2S' -> seconds (float); None on bad input."""
+    if not value or not isinstance(value, str):
+        return None
+    m = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?", value.strip())
+    if not m:
+        return None
+    h = int(m.group(1) or 0)
+    mi = int(m.group(2) or 0)
+    s = float(m.group(3) or 0)
+    return h * 3600 + mi * 60 + s
+
+
+def _analyze_result_from_api(channel_url, max_videos, submitted_url):
+    """Build the analyze result shape from Data API data."""
+    metadata, api_videos = _yt_api_channel_data(channel_url, max_videos)
+    handle = None
+    m = re.search(r"youtube\.com/@([^/?#]+)", submitted_url or "")
+    if m:
+        handle = "@" + m.group(1)
+    videos = []
+    for v in api_videos:
+        pub = v.get("published_at") or ""
+        ymd = pub[:10].replace("-", "") if len(pub) >= 10 else None
+        videos.append({
+            "id": v["video_id"],
+            "title": v.get("title") or "Untitled",
+            "url": f"https://www.youtube.com/watch?v={v['video_id']}",
+            "views": v.get("views"),
+            "likes": v.get("likes"),
+            "comments": v.get("comments"),
+            "duration": _parse_iso8601_duration(v.get("duration")),
+            "upload_date": ymd,
+            "date": pub[:10] if len(pub) >= 10 else pub,
+            "published_at": pub,
+        })
+    result = {
+        "channel": {
+            "name": metadata.get("channel_name") or "",
+            "id": metadata.get("channel_id") or "",
+            "handle": handle or metadata.get("channel_id") or "",
+            "subscribers": metadata.get("subscribers"),
+            "follower_count": metadata.get("subscribers"),
+            "url": channel_url,
+        },
+        "videos": videos,
+    }
+    result["insights"] = _build_insights(videos)
+    result["stats"] = result["insights"]
+    return result
+
+
+_orig_run_analyze_job = _run_analyze_job
+
+
+def _run_analyze_job(job_id, url, max_videos, cache_key):
+    """Analyze wrapper: Data API first (real stats), yt-dlp fallback."""
+    _set_job(job_id, status="running")
+    try:
+        channel_url = _resolve_to_channel_url(url)
+    except Exception:
+        channel_url = url
+    if _yt_key():
+        try:
+            result = _analyze_result_from_api(channel_url, max_videos, url)
+            if not result["videos"]:
+                raise RuntimeError("No public videos found at that URL.")
+            cache_put("analyze", cache_key, result, ttl=3600)
+            _set_job(job_id, status="done", result=result)
+            logger.info("Analyze job %s done via Data API: %d videos", job_id, len(result["videos"]))
+            return
+        except Exception as exc:
+            logger.warning("Analyze Data API path failed (%s); falling back to yt-dlp.", type(exc).__name__)
+    _orig_run_analyze_job(job_id, url, max_videos, cache_key)
