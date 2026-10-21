@@ -1565,3 +1565,263 @@ def _run_script_job(job_id: str, topic: str, style: str, tone: str, length_min: 
     try:
         if HF_API_TOKEN:
             try:
+                script = _hf_generate_script(topic, style, tone, length_min)
+                engine = "huggingface"
+            except Exception as exc:
+                # ANY HF failure falls back to the template engine.
+                logger.warning("HF generation failed (%s); using template engine.", type(exc).__name__)
+                script = template_script(topic, style, tone, length_min)
+        else:
+            script = template_script(topic, style, tone, length_min)
+        words = " ".join(
+            [script.get("hook", ""), script.get("cta", "")]
+            + [b.get("narration", "") for b in script.get("beats", [])]
+        ).split()
+        script["estimated_words"] = len(words)
+        _set_job(job_id, status="done", result={"script": script, "engine": engine})
+        logger.info("Script job %s done (engine=%s)", job_id, engine)
+    except Exception as exc:
+        logger.error("Script job %s failed: %s", job_id, type(exc).__name__)
+        _set_job(job_id, status="error", error="Could not generate the script. Please try again.")
+
+
+@app.post("/api/jobs/script")
+async def create_script(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Invalid JSON body."})
+    topic = str(body.get("topic", "")).strip()
+    style = str(body.get("style", "")).strip().lower()
+    tone = str(body.get("tone", "")).strip().lower()
+    length_min = body.get("length_min", 5)
+
+    if not (3 <= len(topic) <= 200):
+        return JSONResponse(
+            status_code=400, content={"ok": False, "error": "topic must be 3–200 characters."}
+        )
+    if style not in SCRIPT_STYLES:
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": f"style must be one of: {', '.join(SCRIPT_STYLES)}."},
+        )
+    if tone not in SCRIPT_TONES:
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": f"tone must be one of: {', '.join(SCRIPT_TONES)}."},
+        )
+    if not isinstance(length_min, int) or not (1 <= length_min <= 30):
+        return JSONResponse(
+            status_code=400, content={"ok": False, "error": "length_min must be 1–30."}
+        )
+
+    ip = get_client_ip(request)
+    if rate_limited((ip, "jobs/script"), 20):
+        return _rate_limit_response(20)
+
+    job_id = _new_job("script")
+    threading.Thread(
+        target=_run_script_job, args=(job_id, topic, style, tone, length_min), daemon=True
+    ).start()
+    return JSONResponse(status_code=202, content={"job_id": job_id})
+
+
+# ----------------------------------------------------------------------------
+# POST /api/jobs/voiceover — edge-tts MP3 synthesis
+# ----------------------------------------------------------------------------
+VOICES = [
+    "en-US-AriaNeural",
+    "en-US-GuyNeural",
+    "en-US-JennyNeural",
+    "en-GB-SoniaNeural",
+    "en-US-DavisNeural",
+    "en-US-AmberNeural",
+]
+RATE_RE = re.compile(r"^[+-]\d+%$")
+PITCH_RE = re.compile(r"^[+-]\d+Hz$")
+
+
+def _norm_rate(value) -> str | None:
+    """Accept ints/floats/numeric strings (percent) or '+N%' strings → '+N%'."""
+    try:
+        if isinstance(value, str) and RATE_RE.match(value.strip()):
+            return value.strip()
+        n = int(float(str(value).strip().rstrip("%")))
+    except (ValueError, TypeError):
+        return None
+    if not -100 <= n <= 100:
+        return None
+    return f"{'+' if n >= 0 else ''}{n}%"
+
+
+def _norm_pitch(value) -> str | None:
+    """Accept ints/floats/numeric strings (Hz) or '+NHz' strings → '+NHz'."""
+    try:
+        if isinstance(value, str) and PITCH_RE.match(value.strip()):
+            return value.strip()
+        n = int(float(str(value).strip().rstrip("Hz").rstrip("hz")))
+    except (ValueError, TypeError):
+        return None
+    if not -100 <= n <= 100:
+        return None
+    return f"{'+' if n >= 0 else ''}{n}Hz"
+
+
+# In proxied networks, aiohttp's trust_env proxy lookup is unreliable for
+# websockets — pass the proxy URL explicitly to edge-tts when one is set.
+# Unset in normal deployments (e.g. Render), where this stays None.
+_TTS_PROXY = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy") or None
+
+
+def _run_voiceover_job(job_id: str, text: str, voice: str, rate: str, pitch: str) -> None:
+    _set_job(job_id, status="running")
+    out_path = DB_AUDIO_DIR / f"{job_id}.mp3"
+    try:
+        import edge_tts
+
+        async def _synthesize():
+            communicate = edge_tts.Communicate(
+                text, voice, rate=rate, pitch=pitch, proxy=_TTS_PROXY
+            )
+            await communicate.save(str(out_path))
+
+        asyncio.run(_synthesize())
+        if not out_path.exists() or out_path.stat().st_size == 0:
+            raise RuntimeError("TTS produced no audio.")
+        _set_job(job_id, status="done",
+                 result={"audio_url": f"/api/jobs/{job_id}/audio"})
+        logger.info("Voiceover job %s done (%d bytes)", job_id, out_path.stat().st_size)
+    except Exception as exc:
+        logger.error("Voiceover job %s failed: %s", job_id, type(exc).__name__)
+        _set_job(job_id, status="error",
+                 error="Voiceover synthesis failed. Please try again.")
+
+
+@app.post("/api/jobs/voiceover")
+async def create_voiceover(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Invalid JSON body."})
+    text = str(body.get("text", "")).strip()
+    voice = str(body.get("voice", "en-US-AriaNeural")).strip()
+    rate = _norm_rate(body.get("rate", "+0%"))
+    pitch = _norm_pitch(body.get("pitch", "+0Hz"))
+
+    if not (1 <= len(text) <= 3000):
+        return JSONResponse(
+            status_code=400, content={"ok": False, "error": "text must be 1–3000 characters."}
+        )
+    if voice not in VOICES:
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": f"voice must be one of: {', '.join(VOICES)}."},
+        )
+    if rate is None:
+        return JSONResponse(
+            status_code=400, content={"ok": False, "error": 'rate must be a percent between -100 and 100 (e.g. 10 or "+10%").'}
+        )
+    if pitch is None:
+        return JSONResponse(
+            status_code=400, content={"ok": False, "error": 'pitch must be Hz between -100 and 100 (e.g. 5 or "+5Hz").'}
+        )
+
+    ip = get_client_ip(request)
+    if rate_limited((ip, "jobs/voiceover"), 10):
+        return _rate_limit_response(10)
+
+    job_id = _new_job("voiceover")
+    threading.Thread(
+        target=_run_voiceover_job, args=(job_id, text, voice, rate, pitch), daemon=True
+    ).start()
+    return JSONResponse(status_code=202, content={"job_id": job_id})
+
+
+@app.get("/api/jobs/{job_id}/audio")
+async def job_audio(job_id: str):
+    job = _get_job(job_id)
+    if job is None:
+        return JSONResponse(status_code=404, content={"error": "Job not found."})
+    if job["kind"] != "voiceover" or job["status"] != "done":
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": "Audio is only available for completed voiceover jobs."},
+        )
+    path = DB_AUDIO_DIR / f"{job_id}.mp3"
+    if not path.exists():
+        return JSONResponse(status_code=404, content={"error": "Audio file not found."})
+    return FileResponse(str(path), media_type="audio/mpeg", filename=f"voiceover-{job_id}.mp3")
+
+
+# ----------------------------------------------------------------------------
+# Content endpoints — niches + resources
+# ----------------------------------------------------------------------------
+@app.get("/api/niches")
+async def niches():
+    try:
+        data = json.loads(NICHE_FILE.read_text(encoding="utf-8"))
+        return {"niches": data["niches"] if isinstance(data, dict) else data}
+    except Exception as exc:
+        logger.error("Failed to load niches.json: %s", type(exc).__name__)
+        return JSONResponse(
+            status_code=500, content={"ok": False, "error": "Could not load niches."}
+        )
+
+
+RESOURCES = {
+    "hooks": [
+        {"formula": "The curiosity gap",
+         "example": "Nobody knows why this village vanished overnight — but the leading theory will chill you."},
+        {"formula": "The bold claim",
+         "example": "Everything you know about black holes is wrong. Here's the proof."},
+        {"formula": "The forbidden knowledge",
+         "example": "Banks don't want you to understand this one trick — which is exactly why you should."},
+        {"formula": "The ticking clock",
+         "example": "In 47 seconds, you'll understand why this plane never should have taken off."},
+        {"formula": "The contrarian take",
+         "example": "Motivation is useless. Here's what actually separates winners from everyone else."},
+        {"formula": "The personal stake",
+         "example": "This mistake cost me $4,000 — so you don't have to make it."},
+        {"formula": "The unanswered question",
+         "example": "A signal from deep space repeated 3 times, then stopped forever. Scientists are baffled."},
+        {"formula": "The transformation promise",
+         "example": "Watch this once and you'll never look at your sleep the same way again."},
+    ],
+    "titles": [
+        {"formula": "Number + superlative + keyword",
+         "example": "7 Disturbing Facts About the Ocean They Never Taught You"},
+        {"formula": "How/Why + curiosity gap",
+         "example": "Why Nobody Can Solve This 100-Year-Old Mystery"},
+        {"formula": "The untold story angle",
+         "example": "The Untold Story of the Heist That Broke Every Record"},
+        {"formula": "Direct 'you' address",
+         "example": "You're Charging Your Phone Wrong (Here's the Fix)"},
+        {"formula": "Vs. comparison",
+         "example": "Billionaire vs Millionaire Morning Routines — The Shocking Difference"},
+        {"formula": "Time-bound urgency",
+         "example": "What Happened in the Last 60 Seconds Before the Crash"},
+        {"formula": "Myth-busting",
+         "example": "The Titanic Myth Everyone Believes (It's False)"},
+        {"formula": "Listicle with a twist",
+         "example": "5 Places on Earth Science Still Can't Explain"},
+    ],
+    "checklists": {
+        "pre_upload": [
+            "Title under 60 characters with the keyword in the first 40",
+            "Thumbnail text readable at 10% size (3 words max, high contrast)",
+            "First 30 seconds restate the title's promise (no slow intros)",
+            "End screen + pinned comment link to the next video in the series",
+            "Chapters/timestamps added for videos over 8 minutes",
+            "Description: 150+ words, keyword in first 2 lines, 3–5 hashtags",
+            "Captions uploaded (not just auto-captions) for retention + SEO",
+            "Premiere or scheduled at your audience's peak hour",
+        ],
+        "production": [
+            "Script written to ~140 spoken words per minute of target length",
+            "Hook (first 15 seconds) written before anything else",
+            "One visual change every 4–7 seconds (B-roll, graphics, zooms)",
+            "Voiceover recorded in one session for consistent tone",
+            "Background music at -20dB under narration, never competing",
+            "Pattern interrupts (questions, on-screen text) every 60–90 seconds",
+            "Payoff delivered before the 80% mark — no saving it for the end",
+            "CTA placed after the payoff, never before it",
