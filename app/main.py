@@ -313,7 +313,7 @@ if CORS_ORIGINS:
         CORSMiddleware,
         allow_origins=[o.strip() for o in CORS_ORIGINS.split(",") if o.strip()],
         allow_methods=["*"],
-        allow_headers="*",
+        allow_headers=["*"],
     )
     logger.info("CORS enabled for origins: %s", CORS_ORIGINS)
 
@@ -518,7 +518,7 @@ YOUTUBE_URL_RE = re.compile(
 
 
 def _collect_video_entries(data: dict, max_videos: int) -> list:
-        """Flatten yt-dlp's tab/playlist nesting into a list of video entry dicts.
+    """Flatten yt-dlp's tab/playlist nesting into a list of video entry dicts.
 
     A channel URL yields tab sub-playlists (Videos / Live / Shorts) whose
     entries are the real videos; a plain playlist/watch URL yields video
@@ -778,7 +778,7 @@ async def job_download(job_id: str):
         )
     payload = json.dumps(job["result"], indent=2, ensure_ascii=False).encode("utf-8")
     fname = "channel_channel_data.json" if job["kind"] == "full" else "channel-analysis.json"
-        return FileResponse(
+    return FileResponse(
         path=_write_temp_download(job_id, payload),
         media_type="application/json",
         filename=fname,
@@ -1037,7 +1037,7 @@ def _run_full_job(job_id: str, url: str, max_videos: int, cache_key: str) -> Non
             "total_views": total_views,
             "video_count": total_on_channel if total_on_channel else len(videos),
         }
-
+        
         # 3) Outliers vs the channel median.
         import statistics
         view_vals = sorted(v["_views_sort"] for v in videos if v["_views_sort"] > 0)
@@ -1298,7 +1298,7 @@ _OPENERS = {
         "We talk about {t} constantly, yet we rarely stop to ask what it actually means.",
         "There's a question hiding inside {t} that nobody wants to answer honestly.",
     ],
-    }
+}
 
 _MIDDLES = {
     "documentary": [
@@ -1558,7 +1558,7 @@ async def create_script(request: Request):
     length_min = body.get("length_min", 5)
 
     if not (3 <= len(topic) <= 200):
-                return JSONResponse(
+        return JSONResponse(
             status_code=400, content={"ok": False, "error": "topic must be 3–200 characters."}
         )
     if style not in SCRIPT_STYLES:
@@ -1816,7 +1816,6 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_AP
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 GEMINI_TEXT_MODEL = "gemini-2.0-flash"
 GEMINI_IMAGE_MODELS = ("gemini-2.5-flash-image", "gemini-2.0-flash-preview-image-generation")
-
 
 def _gemini_generate(model: str, payload: dict, timeout: int = 120) -> dict:
     req = urllib.request.Request(
