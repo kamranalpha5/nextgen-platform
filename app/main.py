@@ -313,7 +313,7 @@ if CORS_ORIGINS:
         CORSMiddleware,
         allow_origins=[o.strip() for o in CORS_ORIGINS.split(",") if o.strip()],
         allow_methods=["*"],
-        allow_headers=["*"],
+        allow_headers="*",
     )
     logger.info("CORS enabled for origins: %s", CORS_ORIGINS)
 
@@ -518,7 +518,7 @@ YOUTUBE_URL_RE = re.compile(
 
 
 def _collect_video_entries(data: dict, max_videos: int) -> list:
-    """Flatten yt-dlp's tab/playlist nesting into a list of video entry dicts.
+        """Flatten yt-dlp's tab/playlist nesting into a list of video entry dicts.
 
     A channel URL yields tab sub-playlists (Videos / Live / Shorts) whose
     entries are the real videos; a plain playlist/watch URL yields video
@@ -670,6 +670,8 @@ def _build_insights(videos: list) -> dict:
 def _run_analyze_job(job_id: str, url: str, max_videos: int, cache_key: str) -> None:
     _set_job(job_id, status="running")
     try:
+        # A video link resolves to its channel first — any video URL works.
+        url = _resolve_to_channel_url(url)
         cmd = [
             sys.executable, "-m", "yt_dlp",
             "--flat-playlist", "--dump-single-json",
@@ -776,7 +778,7 @@ async def job_download(job_id: str):
         )
     payload = json.dumps(job["result"], indent=2, ensure_ascii=False).encode("utf-8")
     fname = "channel_channel_data.json" if job["kind"] == "full" else "channel-analysis.json"
-    return FileResponse(
+        return FileResponse(
         path=_write_temp_download(job_id, payload),
         media_type="application/json",
         filename=fname,
@@ -788,7 +790,6 @@ def _write_temp_download(job_id: str, payload: bytes) -> str:
     tmp = DATA_DIR / f"download-{job_id}.json"
     tmp.write_bytes(payload)
     return str(tmp)
-
 
 
 # ----------------------------------------------------------------------------
@@ -856,9 +857,9 @@ def _fetch_video_full(video_id: str) -> dict | None:
 
 
 _NEXT_FILM_RE = re.compile(
-    r"(next\s+(film|movie|video)|part\s*(2|two|ii)\b|sequel|",
-    r"another\s+(one|film|movie|video)|please\s+make|make\s+(a\s+)?(next|another)|",
-    r"waiting\s+for|continue\s+(the\s+)?(story|film|movie)|more\s+like\s+this|",
+    r"(next\s+(film|movie|video|part|episode|chapter)|part\s*(2|two|ii)\b|sequel|"
+    r"another\s+(one|film|movie|video)|please\s+make|make\s+(a\s+)?(next|another)|"
+    r"waiting\s+for|continue\s+(the\s+)?(story|film|movie)|more\s+like\s+this|"
     r"next\s+one|bring\s+.*\s+back)",
     re.IGNORECASE,
 )
@@ -924,9 +925,47 @@ def _fetch_transcript(video_id: str) -> str | None:
     return text or None
 
 
+_VIDEO_URL_RE = re.compile(
+    r"(?:youtube\.com/(?:watch\?[^#]*v=|shorts/|live/|embed/|v/)|youtu\.be/)"
+    r"([A-Za-z0-9_-]{6,})"
+)
+
+
+def _resolve_to_channel_url(url: str) -> str:
+    """Video link -> that video's channel /videos page; other URLs pass through.
+
+    Lets the analyzer accept any video link (watch, Shorts, youtu.be, live,
+    embed) and still return the COMPLETE channel JSON, not just that video.
+    """
+    m = _VIDEO_URL_RE.search(url or "")
+    if not m:
+        return url
+    vid = m.group(1)
+    watch = f"https://www.youtube.com/watch?v={vid}"
+    info = _ytdlp_info(watch, ["--extractor-args", "youtube:player_client=android"],
+                       timeout=45)
+    if not (info or {}).get("channel_id") and not (info or {}).get("channel_url"):
+        alt = _ytdlp_info(watch, [], timeout=45)
+        if alt:
+            info = alt
+    if info:
+        cid = info.get("channel_id")
+        if cid:
+            return f"https://www.youtube.com/channel/{cid}/videos"
+        curl = info.get("channel_url") or info.get("uploader_url")
+        if curl:
+            return curl.rstrip("/") + "/videos"
+    raise RuntimeError(
+        "Could not find the channel for that video link. "
+        "Check the link and try again."
+    )
+
+
 def _run_full_job(job_id: str, url: str, max_videos: int, cache_key: str) -> None:
     _set_job(job_id, status="running")
     try:
+        # A video link resolves to its channel first — any video URL works.
+        url = _resolve_to_channel_url(url)
         # 1) Flat channel fetch — ids + channel-level metadata.
         videos_url = url.rstrip("/")
         if not re.search(r"/(videos|streams|shorts)$", videos_url):
@@ -1259,7 +1298,7 @@ _OPENERS = {
         "We talk about {t} constantly, yet we rarely stop to ask what it actually means.",
         "There's a question hiding inside {t} that nobody wants to answer honestly.",
     ],
-}
+    }
 
 _MIDDLES = {
     "documentary": [
@@ -1519,7 +1558,7 @@ async def create_script(request: Request):
     length_min = body.get("length_min", 5)
 
     if not (3 <= len(topic) <= 200):
-        return JSONResponse(
+                return JSONResponse(
             status_code=400, content={"ok": False, "error": "topic must be 3–200 characters."}
         )
     if style not in SCRIPT_STYLES:
